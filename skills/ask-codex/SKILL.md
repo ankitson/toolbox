@@ -1,6 +1,7 @@
-# How to Use Codex from Claude Code
-
-Codex is an AI-powered CLI tool that can help with complex debugging, code analysis, and technical questions. When you encounter difficult problems that would benefit from a second perspective or deep analysis, use Codex.
+---
+name: ask-codex
+description: Codex is an AI-powered CLI tool that can help with complex debugging, code analysis, and technical questions. When you encounter difficult problems that would benefit from a second perspective or deep analysis, use Codex.
+---
 
 ## When to Use Codex
 
@@ -115,4 +116,3 @@ echo "Explain the JPEG progressive AC refinement algorithm" | codex exec --full-
 ```
 
 But for debugging, the file-based pattern is better because you can refine the question and keep a record.
-

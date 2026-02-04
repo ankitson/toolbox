@@ -1,7 +1,9 @@
-# Debug CUDA / GPU Issues
+---
+name: debug-cuda
+description: Use this skill when The user reports CUDA not working, `torch.cuda.is_available()` returning False, or GPU acceleration failures — even though `nvidia-smi` shows the GPU.
+---
 
-## When to use
-The user reports CUDA not working, `torch.cuda.is_available()` returning False, or GPU acceleration failures — even though `nvidia-smi` shows the GPU.
+# Debug CUDA / GPU Issues
 
 ## Key insight
 `nvidia-smi` and CUDA compute use different libraries. `nvidia-smi` uses `libnvidia-ml` (management). PyTorch/CUDA programs use `libcuda` (compute). One can work while the other is broken.
