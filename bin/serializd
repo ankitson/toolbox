@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+import json, os, sys, argparse, textwrap, re
+from pathlib import Path
+from difflib import SequenceMatcher
+
+import requests
+
+API_BASE = "https://serializd.onrender.com"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "serializd"
+CONFIG_FILE = CONFIG_DIR / "auth.json"
+
+FUZZY_THRESHOLD = 0.6
+
+
+class SerializdCLI:
+    def __init__(self):
+        self.scraper = requests.Session()
+        self.scraper.headers.update({"X-Requested-With": "serializd_vercel"})
+        self.token = None
+        self._username = None
+        self._load_token()
+
+    def _load_token(self):
+        if CONFIG_FILE.exists():
+            try:
+                data = json.loads(CONFIG_FILE.read_text())
+                self.token = data.get("token")
+                self._username = data.get("username")
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+    def _save_token(self, token, username):
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps({"token": token, "username": username}, indent=2))
+        CONFIG_FILE.chmod(0o600)
+        self.token = token
+        self._username = username
+
+    def _auth_headers(self):
+        if self.token:
+            return {"Authorization": f"Bearer {self.token}"}
+        return {}
+
+    def _username_or_fetch(self):
+        if self._username:
+            return self._username
+        data = self._request("GET", "/api/user_information")
+        self._username = data.get("username", "")
+        return self._username
+
+    def _ensure_auth(self):
+        if not self.token:
+            print("Authentication required. Run: serializd login", file=sys.stderr)
+            sys.exit(1)
+
+    def _request(self, method, path, **kwargs):
+        self._ensure_auth()
+        headers = kwargs.pop("headers", {})
+        headers.update(self._auth_headers())
+        resp = self.scraper.request(method, f"{API_BASE}{path}", headers=headers, **kwargs)
+        if resp.status_code == 401:
+            print("Session expired. Run: serializd login", file=sys.stderr)
+            sys.exit(1)
+        if resp.status_code >= 400:
+            try:
+                err = resp.json()
+                print(f"Error: {err.get('message', resp.text)}", file=sys.stderr)
+            except Exception:
+                print(f"Error ({resp.status_code}): {resp.text[:200]}", file=sys.stderr)
+            sys.exit(1)
+        return resp.json()
+
+    def _public_request(self, method, path, **kwargs):
+        headers = kwargs.pop("headers", {})
+        headers.update(self._auth_headers())
+        resp = self.scraper.request(method, f"{API_BASE}{path}", headers=headers, **kwargs)
+        if resp.status_code >= 400:
+            try:
+                err = resp.json()
+                print(f"Error: {err.get('message', resp.text)}", file=sys.stderr)
+            except Exception:
+                print(f"Error ({resp.status_code}): {resp.text[:200]}", file=sys.stderr)
+            sys.exit(1)
+        return resp.json()
+
+    # ----- Resolvers -----
+
+    def resolve_show_id(self, show_input, require_auth=False):
+        """Resolve a show input (numeric ID or name) to a show_id int."""
+        try:
+            return int(show_input)
+        except ValueError:
+            pass
+
+        data = self._public_request("GET", "/api/search/shows", params={"search_query": show_input})
+        results = data.get("results", [])
+
+        for s in results:
+            if s["name"].lower() == show_input.lower():
+                print(f"  -> {s['name']} (ID: {s['id']})")
+                return s["id"]
+
+        candidates = []
+        if require_auth or self.token:
+            try:
+                headers = self._auth_headers()
+                resp = self.scraper.get(f"{API_BASE}/api/currently_watching", headers=headers)
+                if resp.status_code == 200:
+                    watching = resp.json()
+                    if isinstance(watching, list):
+                        candidates = [s for s in watching if isinstance(s, dict)]
+                    elif isinstance(watching, dict):
+                        candidates = watching.get("results", watching.get("shows", []))
+            except Exception:
+                pass
+
+        if not candidates:
+            candidates = results
+
+        best = None
+        best_ratio = 0
+        show_lower = show_input.lower()
+        for s in candidates:
+            name = s.get("name", "")
+            ratio = SequenceMatcher(None, show_lower, name.lower()).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best = s
+
+        if best and best_ratio >= FUZZY_THRESHOLD:
+            best_id = best.get("id") or best.get("tmdbId")
+            print(f"  -> {best['name']} (ID: {best_id}) [fuzzy match, {best_ratio:.0%}]")
+            return best_id
+
+        if results:
+            print(f"  -> {results[0]['name']} (ID: {results[0]['id']})")
+            return results[0]["id"]
+
+        print(f"Error: no show found matching '{show_input}'", file=sys.stderr)
+        sys.exit(1)
+
+    def resolve_season_id(self, show_id, season_input, show_data=None):
+        """Resolve a season input to (season_id_int, season_number_int)."""
+        if show_data is None:
+            show_data = self._public_request("GET", f"/api/show/{show_id}")
+
+        seasons = [s for s in show_data["seasons"] if s["seasonNumber"] != 0]
+        seasons_all = show_data["seasons"]
+
+        try:
+            val = int(season_input)
+            if len(seasons_all) > 0 and val > max(s.get("id", 0) for s in seasons_all):
+                pass
+            else:
+                for s in seasons_all:
+                    if s["seasonNumber"] == val:
+                        return s["id"], s["seasonNumber"]
+                if val < 1000:
+                    for s in seasons_all:
+                        if s["seasonNumber"] == val:
+                            return s["id"], s["seasonNumber"]
+                for s in seasons_all:
+                    if s["id"] == val:
+                        return s["id"], s["seasonNumber"]
+        except ValueError:
+            pass
+
+        m = re.match(r'^[sS](\d+)$', season_input.strip())
+        if m:
+            num = int(m.group(1))
+            for s in seasons:
+                if s["seasonNumber"] == num:
+                    return s["id"], s["seasonNumber"]
+            print(f"Error: season {num} not found in show", file=sys.stderr)
+            sys.exit(1)
+
+        inp_lower = season_input.strip().lower()
+        for s in seasons_all:
+            if s.get("name", "").lower() == inp_lower:
+                return s["id"], s["seasonNumber"]
+
+        for s in seasons_all:
+            if s.get("name", "").lower().startswith(inp_lower):
+                return s["id"], s["seasonNumber"]
+
+        print(f"Error: could not resolve season '{season_input}'", file=sys.stderr)
+        print("Available seasons:")
+        for s in seasons:
+            print(f"  S{s['seasonNumber']}  {s['name']}  [ID: {s['id']}]")
+        sys.exit(1)
+
+    # ----- Auth -----
+
+    def login(self, email, password):
+        resp = self.scraper.post(f"{API_BASE}/api/login", json={"email": email, "password": password})
+        if resp.status_code >= 400:
+            try:
+                err = resp.json()
+                print(f"Login failed: {err.get('message', resp.text)}", file=sys.stderr)
+            except Exception:
+                print(f"Login failed ({resp.status_code})", file=sys.stderr)
+            sys.exit(1)
+        data = resp.json()
+        self._save_token(data["token"], data["username"])
+        print(f"Logged in as {data['username']}")
+
+    def logout(self):
+        if CONFIG_FILE.exists():
+            CONFIG_FILE.unlink()
+        self.token = None
+        self._username = None
+        print("Logged out")
+
+    # ----- Search & Browse -----
+
+    def search(self, query):
+        data = self._public_request("GET", "/api/search/shows", params={"search_query": query})
+        results = data.get("results", [])
+        if not results:
+            print("No results found.")
+            return
+        print(f"{'ID':<8} {'Name':<45} {'Year':<6}")
+        print("-" * 65)
+        for s in results:
+            name = s["name"][:43]
+            year = s.get("firstAirDate", "")[:4] if s.get("firstAirDate") else "?"
+            print(f"{s['id']:<8} {name:<45} {year:<6}")
+
+    def show(self, show_input):
+        show_id = self.resolve_show_id(str(show_input))
+        data = self._public_request("GET", f"/api/show/{show_id}")
+        print(f"\n{data['name']}  (ID: {data['id']})")
+        if data.get("tagline"):
+            print(f"  {data['tagline']}")
+        print(f"  Status: {data['status']}")
+        print(f"  Seasons: {data['numSeasons']}  Episodes: {data['numEpisodes']}")
+        genres = ", ".join(g["name"] for g in data.get("genres", []))
+        if genres:
+            print(f"  Genres: {genres}")
+        print()
+        for s in data["seasons"]:
+            if s["seasonNumber"] == 0:
+                print(f"  S{s['seasonNumber']:>2}: {s['name']}  ({s['episodeCount']} episodes)  [ID: {s['id']}]")
+                continue
+            print(f"  S{s['seasonNumber']:>2}: {s['name']}  ({s['episodeCount']} episodes)  [ID: {s['id']}]")
+
+    def season(self, show_input, season_input):
+        show_id = self.resolve_show_id(str(show_input))
+        show_data = self._public_request("GET", f"/api/show/{show_id}")
+        sid, snum = self.resolve_season_id(show_id, str(season_input), show_data)
+        data = self._public_request("GET", f"/api/show/{show_id}/season/{snum}")
+        print(f"\n{show_data['name']} - Season {data['seasonNumber']}: {data['name']}")
+        if data.get("overview"):
+            print(f"  {textwrap.fill(data['overview'], width=72, initial_indent='  ', subsequent_indent='  ')}")
+        print()
+        for ep in data["episodes"]:
+            date = ep.get("airDate", "") or "?"
+            print(f"  S{data['seasonNumber']:>2}E{ep['episodeNumber']:>2}  {ep['name']:<50} {date}")
+
+    # ----- Logging -----
+
+    def log_episodes(self, show_input, season_input, episode_numbers):
+        show_id = self.resolve_show_id(str(show_input))
+        show_data = self._public_request("GET", f"/api/show/{show_id}")
+        sid, snum = self.resolve_season_id(show_id, str(season_input), show_data)
+        self._request("POST", "/api/episode_log/add", json={
+            "episode_numbers": episode_numbers,
+            "season_id": sid,
+            "show_id": show_id,
+        })
+        print(f"Logged S{snum} episodes {episode_numbers}")
+
+    def log_season(self, show_input, season_inputs):
+        show_id = self.resolve_show_id(str(show_input))
+        show_data = self._public_request("GET", f"/api/show/{show_id}")
+        season_ids = []
+        season_nums = []
+        for si in season_inputs:
+            sid, snum = self.resolve_season_id(show_id, str(si), show_data)
+            season_ids.append(sid)
+            season_nums.append(snum)
+        self._request("POST", "/api/watched_v2", json={
+            "season_ids": season_ids,
+            "show_id": show_id,
+        })
+        print(f"Logged S{', S'.join(str(n) for n in season_nums)}")
+
+    def log_show(self, show_input):
+        show_id = self.resolve_show_id(str(show_input))
+        data = self._public_request("GET", f"/api/show/{show_id}")
+        season_ids = [s["id"] for s in data["seasons"] if s["seasonNumber"] > 0]
+        self._request("POST", "/api/watched_v2", json={
+            "season_ids": season_ids,
+            "show_id": show_id,
+        })
+        print(f"Logged all {len(season_ids)} seasons of {data['name']}")
+
+    # ----- Reviews & Status -----
+
+    def _get_logged_episodes(self, show_id):
+        """Fetch all logged episodes for a show from the mobile endpoint."""
+        results = []
+        cursor = None
+        while True:
+            params = {}
+            if cursor:
+                params["next_cursor"] = cursor
+            data = self._request("GET", f"/mobile/page/show/{show_id}/logged_episodes", params=params)
+            batch = data.get("results", [])
+            results.extend(batch)
+            cursor = data.get("nextCursor")
+            if not cursor:
+                break
+        return results
+
+    def _find_episode_data(self, logged, season_id, episode_number):
+        """Find logged episode data matching season + episode number."""
+        for ep in logged:
+            if ep.get("seasonId") == season_id and ep.get("episodeNumber") == episode_number:
+                return ep
+        return None
+
+    def _camel_or_snake(self, d, key):
+        """Get a value from a dict supporting both camelCase and snake_case keys."""
+        snake = key
+        camel = re.sub(r'_(.)', lambda m: m.group(1).upper(), key)
+        return d.get(key) or d.get(camel) or d.get(snake)
+
+    def _print_review(self, r, label="Review"):
+        rating = r.get("rating") or r.get("Rating")
+        stars_str = ""
+        if rating:
+            val = float(rating)
+            if val > 5:
+                val = val / 2
+            stars = int(round(val * 2))
+            stars_str = " " + "*" * stars + "◦" * (10 - stars)
+        print(f"\n{label}:")
+        if rating:
+            display = float(rating) / 2 if float(rating) > 5 else float(rating)
+            print(f"  Rating: {display}/5{stars_str}")
+        text = self._camel_or_snake(r, "review_text")
+        if text:
+            print(f"  Text: {text}")
+        tags = r.get("tags") or r.get("Tags") or []
+        if tags:
+            print(f"  Tags: {', '.join(tags)}")
+        flags = []
+        if r.get("is_log") or r.get("isLog"): flags.append("logged")
+        if r.get("is_rewatch") or r.get("isRewatch"): flags.append("rewatch")
+        if r.get("contains_spoiler") or r.get("containsSpoiler"): flags.append("spoiler")
+        if r.get("allows_comments") is False: flags.append("comments-off")
+        if flags:
+            print(f"  Flags: {', '.join(flags)}")
+        backdate = r.get("backdate") or r.get("backDate") or r.get("dateAdded")
+        if backdate:
+            print(f"  Date: {backdate}")
+        rid = r.get("id") or r.get("reviewId")
+        print(f"  Review ID: {rid}")
+
+    def status(self, show_input, season_input=None, episode_number=None):
+        self._ensure_auth()
+        show_id = self.resolve_show_id(str(show_input))
+        show_data = self._public_request("GET", f"/api/show/{show_id}")
+
+        season_id = None
+        season_number = None
+        if season_input is not None:
+            season_id, season_number = self.resolve_season_id(show_id, str(season_input), show_data)
+
+        logged = self._get_logged_episodes(show_id)
+
+        if season_id is not None and episode_number is not None:
+            ep = self._find_episode_data(logged, season_id, episode_number)
+            if ep:
+                has_log = ep.get("episodeLog") is not None
+                print(f"\n  Episode log: {'yes' if has_log else 'no'}")
+                if has_log:
+                    print(f"  Logged: {ep['episodeLog'].get('dateAdded', '?')}")
+                reviews = ep.get("episodeReviews", [])
+                if reviews:
+                    for i, rev in enumerate(reviews):
+                        self._print_review(rev, f"Review")
+                else:
+                    print("  No reviews for this episode.")
+                return
+
+            print("\n  Episode log: no")
+            print("  No reviews for this episode.")
+
+        elif season_id is not None:
+            season_eps = [ep for ep in logged if ep.get("seasonId") == season_id]
+            if season_eps:
+                print(f"\n  Season has {len(season_eps)} logged episode(s).")
+                total_reviews = sum(len(ep.get("episodeReviews", [])) for ep in season_eps)
+                if total_reviews:
+                    print(f"  {total_reviews} review(s) across the season.")
+                    for ep in season_eps:
+                        for rev in ep.get("episodeReviews", []):
+                            ctx = f" [E{ep['episodeNumber']}]"
+                            self._print_review(rev, f"Review{ctx}")
+                else:
+                    print("  No reviews in this season.")
+            else:
+                print("\n  No logged episodes or reviews in this season.")
+
+        else:
+            if logged:
+                print(f"\n  Show has {len(logged)} logged episode(s).")
+                all_reviews = []
+                for ep in logged:
+                    for rev in ep.get("episodeReviews", []):
+                        all_reviews.append((ep, rev))
+                if all_reviews:
+                    print(f"  {len(all_reviews)} review(s).")
+                    for ep, rev in all_reviews:
+                        ctx = f" [S{ep.get('seasonNumber', '?')}E{ep.get('episodeNumber', '?')}]"
+                        self._print_review(rev, f"Review{ctx}")
+                else:
+                    print("  No reviews for this show.")
+            else:
+                print("\n  No logged episodes or reviews for this show.")
+
+    def review_add(self, show_input, review_text=None, rating=None, season_input=None,
+                   episode_number=None, contains_spoiler=False, backdate=None,
+                   is_log=False, is_rewatch=False, tags=None, allows_comments=True,
+                   like=False, force=False):
+        self._ensure_auth()
+        show_id = self.resolve_show_id(str(show_input))
+        show_data = self._public_request("GET", f"/api/show/{show_id}")
+
+        season_id = None
+        if season_input is not None:
+            season_id, _ = self.resolve_season_id(show_id, str(season_input), show_data)
+
+        logged = self._get_logged_episodes(show_id)
+        if season_id is not None and episode_number is not None:
+            ep = self._find_episode_data(logged, season_id, episode_number)
+            found = ep["episodeReviews"][0] if ep and ep.get("episodeReviews") else None
+        elif season_id is not None:
+            season_eps = [ep for ep in logged if ep.get("seasonId") == season_id]
+            found = None
+            for ep in season_eps:
+                if ep.get("episodeReviews"):
+                    found = ep["episodeReviews"][0]
+                    break
+        else:
+            found = None
+            for ep in logged:
+                if ep.get("episodeReviews"):
+                    found = ep["episodeReviews"][0]
+                    break
+
+        if found and not force:
+            print("A review already exists for this content:")
+            self._print_review(found)
+            try:
+                ans = input("\nOverwrite it? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "n"
+            if ans != "y":
+                print("Cancelled.")
+                return
+            rid = found.get("id") or found.get("reviewId")
+            return self.review_update(rid, review_text=review_text, rating=rating,
+                                       contains_spoiler=contains_spoiler,
+                                       backdate=backdate, is_log=is_log,
+                                       is_rewatch=is_rewatch, episode_number=episode_number,
+                                       tags=tags, allows_comments=allows_comments, like=like)
+
+        payload = {
+            "show_id": show_id,
+            "season_id": season_id,
+            "review_text": review_text or "",
+            "rating": rating,
+            "contains_spoiler": contains_spoiler,
+            "backdate": backdate,
+            "is_log": is_log,
+            "is_rewatch": is_rewatch,
+            "episode_number": episode_number,
+            "tags": tags or [],
+            "allows_comments": allows_comments,
+            "like": like,
+        }
+        payload = {k: v for k, v in payload.items() if v is not None}
+        self._request("POST", "/api/show/reviews/add", json=payload)
+        parts = [show_data["name"]]
+        if episode_number is not None and season_input:
+            parts.append(f"S{season_input}E{episode_number}")
+        elif season_input:
+            parts.append(f"season {season_input}")
+        flags = []
+        if is_log: flags.append("logged")
+        if rating: flags.append(f"rated {rating}")
+        flag_str = f" ({', '.join(flags)})" if flags else ""
+        print(f"Review added for {' '.join(parts)}{flag_str}")
+
+
+
+    def review_update(self, review_id, review_text=None, rating=None,
+                      contains_spoiler=None, backdate=None, is_log=None,
+                      is_rewatch=None, episode_number=None, tags=None,
+                      allows_comments=None, like=None):
+        self._ensure_auth()
+        payload = {"review_id": review_id}
+        for k, v in [("review_text", review_text), ("rating", rating),
+                     ("contains_spoiler", contains_spoiler), ("backdate", backdate),
+                     ("is_log", is_log), ("is_rewatch", is_rewatch),
+                     ("episode_number", episode_number), ("tags", tags),
+                     ("allows_comments", allows_comments), ("like", like)]:
+            if v is not None:
+                payload[k] = v
+        self._request("POST", "/api/show/reviews/update", json=payload)
+        print(f"Review {review_id} updated.")
+
+    def review_delete(self, review_id):
+        self._ensure_auth()
+        self._request("POST", "/api/show/reviews/delete", json={"review_id": review_id})
+        print(f"Review {review_id} deleted.")
+
+    # ----- Status -----
+
+    def whoami(self):
+        if self.token:
+            try:
+                data = self._request("GET", "/api/user_information")
+                username = data.get("username", "?")
+                print(f"Logged in as {username}")
+            except SystemExit:
+                print("Session expired. Run: serializd login")
+        else:
+            print("Not logged in. Run: serializd login")
+
+
+def _ranged_rating(v):
+    v = float(v)
+    if v < 0.5 or v > 5.0:
+        raise argparse.ArgumentTypeError("rating must be between 0.5 and 5.0")
+    return v
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Log and review TV episodes on Serializd")
+    parser.add_argument("--token", help="Serializd auth token (or set SERIALIZD_TOKEN env)")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # login / logout
+    p_login = sub.add_parser("login", help="Login to Serializd")
+    p_login.add_argument("email", help="Account email")
+    p_login.add_argument("password", help="Account password")
+    sub.add_parser("logout", help="Clear saved credentials")
+
+    # search / show / season
+    p_search = sub.add_parser("search", help="Search for a show")
+    p_search.add_argument("query", help="Show name to search")
+
+    p_show = sub.add_parser("show", help="Show details and seasons")
+    p_show.add_argument("show", help="TMDB show ID or name (e.g. 1396, 'Breaking Bad')")
+
+    p_season = sub.add_parser("season", help="Show season episodes")
+    p_season.add_argument("show", help="TMDB show ID or name")
+    p_season.add_argument("season", help="Season: number, S4, or name ('Specials', 'Season 1')")
+
+    # log
+    p_log = sub.add_parser("log", help="Log episodes as watched")
+    p_log.add_argument("show", help="TMDB show ID or name")
+    p_log.add_argument("season", help="Season: number, S4, or name")
+    p_log.add_argument("episodes", nargs="+", type=int, help="Episode number(s) to log")
+
+    p_log_season = sub.add_parser("log-season", help="Log entire season as watched")
+    p_log_season.add_argument("show", help="TMDB show ID or name")
+    p_log_season.add_argument("season", nargs="+", help="Season(s): number, S4, or name")
+
+    p_log_show = sub.add_parser("log-show", help="Log entire show as watched")
+    p_log_show.add_argument("show", help="TMDB show ID or name")
+
+    # review-add
+    p_ra = sub.add_parser("review-add", help="Write a review (with optional log)")
+    p_ra.add_argument("show", help="TMDB show ID or name")
+    p_ra.add_argument("--season", default=None, help="Season: number, S4, or name (for episode/season reviews)")
+    p_ra.add_argument("--episode", type=int, default=None, help="Episode number (for episode reviews)")
+    p_ra.add_argument("--rating", type=_ranged_rating, default=None, help="Rating 0.5-5.0 (0.5 steps)")
+    p_ra.add_argument("--text", default=None, help="Review text")
+    p_ra.add_argument("--spoiler", action="store_true", help="Mark as containing spoilers")
+    p_ra.add_argument("--backdate", default=None, help="Backdate (ISO date, e.g. 2024-01-15)")
+    p_ra.add_argument("--log", action="store_true", help="Also add to diary (log the episode/show)")
+    p_ra.add_argument("--rewatch", action="store_true", help="Mark as a rewatch")
+    p_ra.add_argument("--tags", nargs="*", default=[], help="Tags")
+    p_ra.add_argument("--no-comments", action="store_true", help="Disable comments on review")
+    p_ra.add_argument("--no-like", action="store_true", help="Don't auto-like your review")
+    p_ra.add_argument("--force", action="store_true", help="Overwrite existing review without prompt")
+
+    # review-update
+    p_ru = sub.add_parser("review-update", help="Update an existing review")
+    p_ru.add_argument("review_id", help="Review ID to update")
+    p_ru.add_argument("--rating", type=_ranged_rating, default=None, help="Rating 0.5-5.0")
+    p_ru.add_argument("--text", default=None, help="Review text")
+    p_ru.add_argument("--spoiler", action="store_true", default=None, help="Mark as spoiler")
+    p_ru.add_argument("--no-spoiler", action="store_true", default=None, help="Unmark spoiler")
+    p_ru.add_argument("--backdate", default=None, help="Backdate (ISO date)")
+    p_ru.add_argument("--log", action="store_true", default=None, help="Add/keep as log")
+    p_ru.add_argument("--no-log", action="store_true", default=None, help="Remove from log")
+    p_ru.add_argument("--rewatch", action="store_true", default=None, help="Mark rewatch")
+    p_ru.add_argument("--no-rewatch", action="store_true", default=None, help="Unmark rewatch")
+    p_ru.add_argument("--tags", nargs="*", default=None, help="Tags")
+    p_ru.add_argument("--no-comments", action="store_true", default=None, help="Disable comments")
+    p_ru.add_argument("--no-like", action="store_true", default=None, help="Don't auto-like")
+
+    # review-delete
+    p_rd = sub.add_parser("review-delete", help="Delete a review")
+    p_rd.add_argument("review_id", help="Review ID to delete")
+
+    # status
+    p_st = sub.add_parser("status", help="Check existing reviews/logs for a show/episode")
+    p_st.add_argument("show", help="TMDB show ID or name")
+    p_st.add_argument("--season", default=None, help="Season: number, S4, or name")
+    p_st.add_argument("--episode", type=int, default=None, help="Episode number")
+
+    # whoami
+    sub.add_parser("whoami", help="Show current logged-in user")
+
+    args = parser.parse_args()
+
+    cli = SerializdCLI()
+
+    if args.token:
+        cli.token = args.token
+    elif os.environ.get("SERIALIZD_TOKEN"):
+        cli.token = os.environ["SERIALIZD_TOKEN"]
+
+    if args.command == "login":
+        cli.login(args.email, args.password)
+    elif args.command == "logout":
+        cli.logout()
+    elif args.command == "search":
+        cli.search(args.query)
+    elif args.command == "show":
+        cli.show(args.show)
+    elif args.command == "season":
+        cli.season(args.show, args.season)
+    elif args.command == "log":
+        cli.log_episodes(args.show, args.season, args.episodes)
+    elif args.command == "log-season":
+        cli.log_season(args.show, args.season)
+    elif args.command == "log-show":
+        cli.log_show(args.show)
+    elif args.command == "review-add":
+        cli.review_add(
+            args.show,
+            review_text=args.text,
+            rating=args.rating,
+            season_input=args.season,
+            episode_number=args.episode,
+            contains_spoiler=args.spoiler,
+            backdate=args.backdate,
+            is_log=args.log,
+            is_rewatch=args.rewatch,
+            tags=args.tags,
+            allows_comments=not args.no_comments,
+            like=not args.no_like,
+            force=args.force,
+        )
+    elif args.command == "review-update":
+        spoiler = None
+        if args.spoiler: spoiler = True
+        if args.no_spoiler: spoiler = False
+        log_val = None
+        if args.log: log_val = True
+        if args.no_log: log_val = False
+        rewatch = None
+        if args.rewatch: rewatch = True
+        if args.no_rewatch: rewatch = False
+        cli.review_update(
+            args.review_id,
+            review_text=args.text,
+            rating=args.rating,
+            contains_spoiler=spoiler,
+            backdate=args.backdate,
+            is_log=log_val,
+            is_rewatch=rewatch,
+            tags=args.tags,
+            allows_comments=None if args.no_comments is None else not args.no_comments,
+            like=None if args.no_like is None else not args.no_like,
+        )
+    elif args.command == "review-delete":
+        cli.review_delete(args.review_id)
+    elif args.command == "status":
+        cli.status(args.show, season_input=args.season, episode_number=args.episode)
+    elif args.command == "whoami":
+        cli.whoami()
+
+
+if __name__ == "__main__":
+    main()

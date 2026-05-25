@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["letterboxdpy", "requests", "beautifulsoup4"]
+# ///
+import json, os, sys, argparse, time, re
+from pathlib import Path
+from difflib import SequenceMatcher
+from datetime import date, datetime
+
+import requests
+from bs4 import BeautifulSoup
+
+from letterboxdpy.movie import Movie
+from letterboxdpy.user import User
+from letterboxdpy.search import Search
+from letterboxdpy.watchlist import Watchlist
+from letterboxdpy.auth import UserSession
+
+API_BASE = "https://letterboxd.com"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "letterboxd"
+COOKIE_PATH = CONFIG_DIR / "cookies.json"
+AUTH_FILE = CONFIG_DIR / "auth.json"
+FUZZY_THRESHOLD = 0.6
+REQUEST_DELAY = 2.5
+
+
+class LetterboxdCLI:
+    def __init__(self):
+        self.raw_session = requests.Session()
+        self.raw_session.headers.update({
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+        self.lb_session = None
+        self._username = None
+        self._load_session()
+
+    # ----- Config persistence -----
+
+    def _load_session(self):
+        if AUTH_FILE.exists():
+            try:
+                data = json.loads(AUTH_FILE.read_text())
+                self._username = data.get("username")
+                if COOKIE_PATH.exists():
+                    self.lb_session = UserSession.load(COOKIE_PATH)
+            except Exception:
+                pass
+
+    def _save_session(self, username):
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        AUTH_FILE.write_text(json.dumps({"username": username}, indent=2))
+        AUTH_FILE.chmod(0o600)
+        self._username = username
+
+    def _remove_session(self):
+        if not CONFIG_DIR.exists():
+            return
+        for f in [AUTH_FILE, COOKIE_PATH]:
+            if f.exists():
+                f.unlink()
+
+    # ----- Rate limiting -----
+
+    def _ratelimit(self):
+        time.sleep(REQUEST_DELAY)
+
+    # ----- Auth -----
+
+    def login(self, email, password):
+        self._ratelimit()
+        self.lb_session = UserSession.login(email, password, path=COOKIE_PATH)
+        self._save_session(self.lb_session.username)
+        print(f"Logged in as {self.lb_session.username}")
+
+    def logout(self):
+        self._remove_session()
+        self.lb_session = None
+        self._username = None
+        print("Logged out")
+
+    def whoami(self):
+        if not self.lb_session:
+            print("Not logged in. Run: letterboxd login")
+            return
+        self._ratelimit()
+        try:
+            valid = self.lb_session.is_logged_in
+            if valid:
+                print(f"Logged in as {self.lb_session.username}")
+            else:
+                print("Session expired. Run: letterboxd login")
+        except Exception:
+            print("Session expired. Run: letterboxd login")
+
+    # ----- Resolver -----
+
+    def resolve_film(self, film_input):
+        if re.match(r'^\d+$', film_input):
+            self._ratelimit()
+            m = Movie(tmdb=int(film_input))
+            return m.slug, m.title, m.year
+
+        slug_match = re.match(r'^https://letterboxd\.com/film/([^/]+)/', film_input)
+        if slug_match:
+            self._ratelimit()
+            m = Movie(slug_match.group(1))
+            return m.slug, m.title, m.year
+
+        try:
+            m = Movie(film_input)
+            self._ratelimit()
+            return m.slug, m.title, m.year
+        except Exception:
+            pass
+
+        self._ratelimit()
+        s = Search(film_input, search_filter="films")
+        results = s.results.get("results", [])
+
+        if not results:
+            print(f"Error: no film found matching '{film_input}'", file=sys.stderr)
+            sys.exit(1)
+
+        for r in results:
+            if r["title"].lower() == film_input.lower():
+                print(f"  -> {r['title']} ({r['year']}) [slug: {r['slug']}]")
+                return r["slug"], r["title"], r.get("year")
+
+        candidates = results
+        best = None
+        best_ratio = 0
+        inp_lower = film_input.lower()
+        for r in candidates:
+            name = r.get("title", "")
+            ratio = SequenceMatcher(None, inp_lower, name.lower()).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best = r
+
+        if best and best_ratio >= FUZZY_THRESHOLD:
+            print(f"  -> {best['title']} ({best.get('year', '?')}) [fuzzy match, {best_ratio:.0%}]")
+            return best["slug"], best["title"], best.get("year")
+
+        first = results[0]
+        print(f"  -> {first['title']} ({first.get('year', '?')}) [slug: {first['slug']}]")
+        return first["slug"], first["title"], first.get("year")
+
+    # ----- Search & Browse -----
+
+    def search(self, query):
+        self._ratelimit()
+        s = Search(query, search_filter="films")
+        results = s.results.get("results", [])
+        if not results:
+            print("No results found.")
+            return
+
+        print(f"{'Slug':<30} {'Title':<45} {'Year':<6}")
+        print("-" * 80)
+        for r in results:
+            title = (r["title"] or "")[:43]
+            year = r.get("year") or "?"
+            slug = (r["slug"] or "")[:28]
+            print(f"{slug:<30} {title:<45} {str(year):<6}")
+
+    def film(self, film_input):
+        slug, title, year = self.resolve_film(film_input)
+        self._ratelimit()
+        m = Movie(slug)
+        print(f"\n{title}  ({year})")
+        if m.tagline:
+            print(f"  {m.tagline}")
+        if m.rating:
+            stars = "*" * int(round(m.rating)) + "◦" * (5 - int(round(m.rating)))
+            print(f"  Rating: {m.rating:.2f}/5 {stars}")
+        if m.runtime:
+            print(f"  Runtime: {m.runtime} min")
+        if m.genres:
+            genres = ", ".join(g.get("name", "") for g in m.genres)
+            print(f"  Genres: {genres}")
+        if m.crew:
+            directors = m.crew.get("director", [])
+            if directors:
+                names = ", ".join(d.get("name", "") for d in directors)
+                print(f"  Director: {names}")
+        print()
+        if m.description:
+            import textwrap
+            for line in textwrap.wrap(m.description, width=72):
+                print(f"  {line}")
+            print()
+
+        if m.cast:
+            print("  Cast:")
+            for c in m.cast[:8]:
+                role = f" as {c.get('roleName', '')}" if c.get("roleName") else ""
+                print(f"    {c.get('name', '?')}{role}")
+            print()
+        print(f"  URL: {m.url}")
+        if m.tmdb_id:
+            print(f"  TMDB: {m.tmdb_id}")
+
+    # ----- Diary -----
+
+    def diary(self, username, limit=20):
+        self._ratelimit()
+        u = User(username)
+        diary_data = u.get_diary()
+        entries = diary_data.get("entries", {})
+        if not entries:
+            print("No diary entries found.")
+            return
+
+        items = sorted(entries.items(), key=lambda x: x[1].get("date", ""), reverse=True)
+        if limit:
+            items = items[:limit]
+
+        print(f"\n{'Date':<14} {'Film':<50} {'Rating':<6}")
+        print("-" * 75)
+        for eid, entry in items:
+            d = entry.get("date", "")[:10]
+            name = (entry.get("name", "") or "")[:48]
+            rating = entry.get("actions", {}).get("rating", "")
+            rating_str = f"{rating}/5" if rating else "-"
+            print(f"{d:<14} {name:<50} {rating_str:<6}")
+
+    # ----- Watchlist -----
+
+    def watchlist(self, username, limit=30):
+        self._ratelimit()
+        w = Watchlist(username)
+        count = w.get_count()
+        movies = w.get_movies()
+        if not movies:
+            print("Watchlist is empty.")
+            return
+
+        items = list(movies.values())
+        if limit:
+            items = items[:limit]
+
+        print(f"\nWatchlist ({count} films):")
+        print(f"{'Title':<50} {'Year':<6}")
+        print("-" * 60)
+        for m in items:
+            name = (m.get("name", "") or "")[:48]
+            year = m.get("year", "?")
+            print(f"{name:<50} {year:<6}")
+        if limit and count > limit:
+            print(f"  ... and {count - limit} more")
+
+    # ----- Stats -----
+
+    def stats(self, username):
+        self._ratelimit()
+        u = User(username)
+        s = u.stats
+
+        print(f"\nStats for {u.display_name or username}:")
+        print(f"  Total films: {s.get('films', '?')}")
+        print(f"  This year:   {s.get('this_year', '?')}")
+        print(f"  Lists:       {s.get('lists', '?')}")
+        print(f"  Following:   {s.get('following', '?')}")
+        print(f"  Followers:   {s.get('followers', '?')}")
+
+        self._ratelimit()
+        films_data = u.get_films()
+        films = films_data.get("movies", films_data)
+        if isinstance(films, dict):
+            ratings = [f.get("rating") for f in films.values() if isinstance(f, dict) and f.get("rating") is not None]
+        else:
+            ratings = []
+        if ratings:
+            avg = sum(ratings) / len(ratings)
+            print(f"\n  Average rating: {avg:.2f}/5")
+            print(f"  Rated films:    {len(ratings)}")
+
+            from collections import Counter
+            groups = Counter(ratings)
+            print(f"\n  Rating distribution:")
+            for star in [5.0, 4.5, 4.0, 3.5, 3.0, 2.5, 2.0, 1.5, 1.0, 0.5]:
+                count = groups.get(star, 0)
+                if count:
+                    bar = "#" * min(count, 40)
+                    print(f"    {star:.1f}: {bar} ({count})")
+
+    # ----- Log / Write operations (experimental) -----
+
+    def _get_cookie_jar(self):
+        if not self.lb_session:
+            print("Authentication required. Run: letterboxd login", file=sys.stderr)
+            sys.exit(1)
+        try:
+            for c in self.lb_session.session.cookies.jar:
+                self.raw_session.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
+        except Exception as e:
+            print(f"Error reading session: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    def log(self, film_input, rating=None, review_text=None, diary_date=None,
+            rewatch=False, tags=None, spoiler=False, like=False):
+        slug, title, year = self.resolve_film(film_input)
+        self._ensure_auth()
+        self._get_cookie_jar()
+
+        self._ratelimit()
+        url = f"{API_BASE}/film/{slug}/"
+        resp = self.raw_session.get(url)
+        if resp.status_code >= 400:
+            print(f"Error fetching film page ({resp.status_code})", file=sys.stderr)
+            sys.exit(1)
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        form = soup.select_one("form[action*='log']") or soup.select_one("form.js-log-form")
+        if not form:
+            print("Could not find log form on page.", file=sys.stderr)
+            sys.exit(1)
+
+        action = form.get("action", "")
+        if not action.startswith("http"):
+            action = f"{API_BASE}{action}" if action.startswith("/") else f"{url}{action}"
+
+        csrf_input = form.select_one("input[name='_csrf']") or form.select_one("input[name='csrfmiddlewaretoken']")
+        payload = {}
+        if csrf_input:
+            payload[csrf_input.get("name")] = csrf_input.get("value")
+
+        payload["rating"] = str(rating) if rating else ""
+        payload["rewatch"] = "true" if rewatch else ""
+        if diary_date:
+            payload["date"] = diary_date
+        if review_text:
+            payload["review"] = review_text
+            payload["containsSpoilers"] = "true" if spoiler else "false"
+        if tags:
+            payload["tags"] = ",".join(tags)
+        if like:
+            payload["like"] = "true"
+
+        self._ratelimit()
+        resp2 = self.raw_session.post(action, data=payload)
+        if resp2.status_code >= 400:
+            print(f"Error logging film ({resp2.status_code})", file=sys.stderr)
+            sys.exit(1)
+
+        parts = [title]
+        if rating:
+            parts.append(f"[{rating}/5]")
+        if review_text:
+            parts.append("+ review")
+        print(f"Logged {' '.join(parts)}")
+
+    def review_update(self, log_entry_id, rating=None, review_text=None, spoiler=None):
+        self._ensure_auth()
+        self._get_cookie_jar()
+        self._ratelimit()
+        url = f"{API_BASE}/log-entry/{log_entry_id}/"
+        resp = self.raw_session.get(url)
+        if resp.status_code >= 400:
+            print(f"Could not find log entry ({resp.status_code})", file=sys.stderr)
+            sys.exit(1)
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        form = soup.select_one("form.js-log-form") or soup.select_one("form[action*='log']")
+        if not form:
+            print("Could not find edit form on page.", file=sys.stderr)
+            sys.exit(1)
+
+        action = form.get("action", "")
+        if not action.startswith("http"):
+            action = f"{API_BASE}{action}" if action.startswith("/") else f"{url}{action}"
+
+        payload = {}
+        csrf_input = form.select_one("input[name='_csrf']") or form.select_one("input[name='csrfmiddlewaretoken']")
+        if csrf_input:
+            payload[csrf_input.get("name")] = csrf_input.get("value")
+        if rating is not None:
+            payload["rating"] = str(rating)
+        if review_text is not None:
+            payload["review"] = review_text
+        if spoiler is not None:
+            payload["containsSpoilers"] = "true" if spoiler else "false"
+
+        self._ratelimit()
+        resp2 = self.raw_session.post(action, data=payload)
+        if resp2.status_code >= 400:
+            print(f"Error updating review ({resp2.status_code})", file=sys.stderr)
+            sys.exit(1)
+        print(f"Review {log_entry_id} updated.")
+
+    def review_delete(self, log_entry_id):
+        self._ensure_auth()
+        self._get_cookie_jar()
+
+        self._ratelimit()
+        delete_url = f"{API_BASE}/log-entry/{log_entry_id}/delete/"
+        resp = self.raw_session.post(delete_url)
+        if resp.status_code >= 400:
+            print(f"Error deleting review ({resp.status_code})", file=sys.stderr)
+            sys.exit(1)
+        print(f"Log entry {log_entry_id} deleted.")
+
+    def _ensure_auth(self):
+        if not self.lb_session:
+            print("Authentication required. Run: letterboxd login", file=sys.stderr)
+            sys.exit(1)
+
+
+def _ranged_rating(v):
+    v = float(v)
+    if v < 0.5 or v > 5.0:
+        raise argparse.ArgumentTypeError("rating must be between 0.5 and 5.0")
+    return v
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Search, log, and review films on Letterboxd",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_login = sub.add_parser("login", help="Login to Letterboxd")
+    p_login.add_argument("email", help="Account email")
+    p_login.add_argument("password", help="Account password")
+    sub.add_parser("logout", help="Clear saved credentials")
+
+    p_search = sub.add_parser("search", help="Search for a film")
+    p_search.add_argument("query", help="Film name to search")
+
+    p_film = sub.add_parser("film", help="Show film details")
+    p_film.add_argument("film", help="Letterboxd slug, TMDB ID, or name (e.g. 'the-matrix', '603')")
+
+    p_log = sub.add_parser("log", help="Log a film as watched (with optional review)")
+    p_log.add_argument("film", help="Letterboxd slug, TMDB ID, or name")
+    p_log.add_argument("--rating", type=_ranged_rating, default=None, help="Rating 0.5-5.0 (0.5 steps)")
+    p_log.add_argument("--review", default=None, help="Review text")
+    p_log.add_argument("--date", default=None, help="Watch date (ISO, e.g. 2025-05-20)")
+    p_log.add_argument("--rewatch", action="store_true", help="Mark as rewatch")
+    p_log.add_argument("--spoiler", action="store_true", help="Mark review as containing spoilers")
+    p_log.add_argument("--tags", nargs="*", default=[], help="Tags")
+    p_log.add_argument("--like", action="store_true", help="Like the review")
+
+    p_diary = sub.add_parser("diary", help="Show diary entries for a user")
+    p_diary.add_argument("username", nargs="?", help="Letterboxd username (default: logged-in user)")
+    p_diary.add_argument("--limit", type=int, default=20, help="Max entries to show")
+
+    p_watchlist = sub.add_parser("watchlist", help="Show watchlist for a user")
+    p_watchlist.add_argument("username", nargs="?", help="Letterboxd username (default: logged-in user)")
+    p_watchlist.add_argument("--limit", type=int, default=30, help="Max films to show")
+
+    p_stats = sub.add_parser("stats", help="Show stats for a user")
+    p_stats.add_argument("username", help="Letterboxd username")
+
+    sub.add_parser("whoami", help="Show current logged-in user")
+
+    p_review_update = sub.add_parser("review-update", help="Update an existing review")
+    p_review_update.add_argument("log_entry_id", help="Log entry ID to update")
+    p_review_update.add_argument("--rating", type=_ranged_rating, default=None, help="Rating 0.5-5.0")
+    p_review_update.add_argument("--review", default=None, help="Review text")
+    p_review_update.add_argument("--spoiler", action="store_true", default=None, help="Mark as spoiler")
+    p_review_update.add_argument("--no-spoiler", action="store_true", default=None, help="Unmark spoiler")
+
+    p_review_delete = sub.add_parser("review-delete", help="Delete a review/log entry")
+    p_review_delete.add_argument("log_entry_id", help="Log entry ID to delete")
+
+    args = parser.parse_args()
+
+    cli = LetterboxdCLI()
+
+    if args.command == "login":
+        cli.login(args.email, args.password)
+    elif args.command == "logout":
+        cli.logout()
+    elif args.command == "whoami":
+        cli.whoami()
+    elif args.command == "search":
+        cli.search(args.query)
+    elif args.command == "film":
+        cli.film(args.film)
+    elif args.command == "log":
+        cli.log(args.film, rating=args.rating, review_text=args.review,
+                diary_date=args.date, rewatch=args.rewatch,
+                tags=args.tags, spoiler=args.spoiler, like=args.like)
+    elif args.command == "diary":
+        username = args.username or cli._username
+        if not username:
+            print("Username required (provide as argument or login first)", file=sys.stderr)
+            sys.exit(1)
+        cli.diary(username, limit=args.limit)
+    elif args.command == "watchlist":
+        username = args.username or cli._username
+        if not username:
+            print("Username required (provide as argument or login first)", file=sys.stderr)
+            sys.exit(1)
+        cli.watchlist(username, limit=args.limit)
+    elif args.command == "stats":
+        cli.stats(args.username)
+    elif args.command == "review-update":
+        spoiler = None
+        if args.spoiler:
+            spoiler = True
+        if args.no_spoiler:
+            spoiler = False
+        cli.review_update(args.log_entry_id, rating=args.rating,
+                          review_text=args.review, spoiler=spoiler)
+    elif args.command == "review-delete":
+        cli.review_delete(args.log_entry_id)
+
+
+if __name__ == "__main__":
+    main()
