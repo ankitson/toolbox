@@ -16,3 +16,7 @@
 
 ## Javascript
 - Prefer `bun` and typescript over other tools
+
+# Environment
+
+@~/AGENTS.env.md
