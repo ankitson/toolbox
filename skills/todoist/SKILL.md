@@ -52,6 +52,17 @@ Intent routing:
 
 List endpoints return `{"results": [...], "next_cursor": ...}` — use `jq '.results[]'`.
 
+**Paginate.** Default page = 50. If `.next_cursor` is non-null, more pages exist — fetch with `?cursor=<next_cursor>` until `.next_cursor == null`. Single-page reads silently miss tasks past 50. Pattern:
+
+```bash
+CURSOR=""; while :; do
+  R=$(curl -s -H "$H" "https://api.todoist.com/api/v1/tasks?limit=200${CURSOR:+&cursor=$CURSOR}")
+  echo "$R" | jq -c ".results[]"      # or accumulate
+  CURSOR=$(echo "$R" | jq -r ".next_cursor // empty")
+  [ -z "$CURSOR" ] && break
+done
+```
+
 ```bash
 # active tasks
 curl -s -H "$H" "https://api.todoist.com/api/v1/tasks" | jq '.results[]'
