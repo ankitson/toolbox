@@ -7,6 +7,15 @@ description: Use this skill when working with the 1Password CLI (`op` command) f
 
 Use this skill when working with the 1Password CLI (`op` command) for secrets management, retrieving API keys, or injecting secrets into development environments.
 
+## Non-interactive use (service account)
+
+`op read 'op://vault/item/field'` works without an interactive signin as long as `OP_SERVICE_ACCOUNT_TOKEN` is exported.
+
+- **Containers (`agent-devbox`, `openclaw`):** token is injected via docker-compose `env_file` (`secrets/{agent-devbox,openclaw}.env`, rendered by `just rs`). `op read` just works.
+- **Host shell:** dotfiles' `.bashrc` sources `~/.config/op/service-account.env` if present (chmod 600, hand-managed per machine). To enable: `mkdir -p ~/.config/op && chmod 700 ~/.config/op` then create the file with `export OP_SERVICE_ACCOUNT_TOKEN=ops_…` and `chmod 600`.
+
+Skills that need a secret should prefer `op read` over passing keys via plaintext env files or hardcoding.
+
 ## Secret Reference Syntax
 
 Secret references use the URI format: `op://vault/item/[section/]field`
