@@ -16,11 +16,23 @@ H="Authorization: Bearer $TODOIST_API_TOKEN"
 
 Prereq: `OP_SERVICE_ACCOUNT_TOKEN` in env (auto on agent-devbox + openclaw; host: see [`1password-cli`](../1password-cli/SKILL.md)). Never echo `$TODOIST_API_TOKEN`.
 
-## ⚠️ Hard rule — recurring tasks
+## ⚠️ Hard rules
 
-**NEVER PATCH `due_string` on a task where `due.is_recurring == true`.** The `POST /api/v1/tasks/{id}` endpoint re-parses natural language and replaces the entire `due` block — destroys rules like "every other Tuesday and Friday". Confirmed bug pattern in Doist/todoist-ai #279.
+1. **Never modify existing task without explicit user confirm.** Covers close, complete, reschedule, update, delete. Confirm = user said yes this session, after seeing task + intent. Create + read: no confirm.
+2. **Never PATCH `due_string` on recurring task** (`due.is_recurring == true`). Re-parses NL, replaces `due` block, destroys rules. Bug: Doist/todoist-ai #279.
 
-Before any update on a recurring task, first GET it and route by intent:
+Confirm template:
+
+```
+About to <intent> task <id>:
+  content: "<content>"
+  due:     "<due.string>" (recurring=<bool>)
+Proceed? (y/N)
+```
+
+Show, wait, proceed on explicit yes only.
+
+Before recurring-task update: GET first, route by intent:
 
 ```bash
 # check recurring first
@@ -74,6 +86,8 @@ curl -s -H "$H" -H "Content-Type: application/json" \
 
 ## Complete / advance one occurrence
 
+**Confirm per #1.**
+
 ```bash
 # safest: advances recurring tasks correctly, completes non-recurring
 curl -s -H "$H" -X POST "https://api.todoist.com/api/v1/tasks/$ID/close"
@@ -82,6 +96,8 @@ curl -s -H "$H" -X POST "https://api.todoist.com/api/v1/tasks/$ID/close"
 Use for "I did today's instance of laundry-every-friday." Returns 204 on success.
 
 ## Reschedule one instance
+
+**Confirm per #1.**
 
 To move only this occurrence without re-parsing the rule, use **Sync API**, copy the existing `due` block, change only `date`:
 
@@ -108,13 +124,15 @@ This preserves `string` (the recurrence rule), `is_recurring`, `timezone`, `lang
 
 ## Permanently complete a recurring task (stop the rule)
 
-Explicit, destructive — **ask user to confirm**:
+**Confirm per #1. Extra-destructive: show rule string user loses.**
 
 ```bash
 curl -s -H "$H" -X POST "https://api.todoist.com/api/v1/tasks/$ID/complete"
 ```
 
 ## Update non-recurring task
+
+**Confirm per #1.**
 
 ```bash
 curl -s -H "$H" -H "Content-Type: application/json" \
@@ -125,6 +143,8 @@ curl -s -H "$H" -H "Content-Type: application/json" \
 If the task may be recurring, GET first and route per the table above.
 
 ## Delete
+
+**Confirm per #1. No undo via API.**
 
 ```bash
 curl -s -H "$H" -X DELETE "https://api.todoist.com/api/v1/tasks/$ID"
