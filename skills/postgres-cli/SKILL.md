@@ -1,6 +1,6 @@
 ---
 name: postgres-cli
-description: "Home Postgres: psql queries, garmin, pipeline state, schema, op."
+description: "Home Postgres: psql queries, garmin, banking, playnite, dagster, schema, op."
 ---
 
 # Postgres CLI
@@ -25,8 +25,8 @@ Prereq: `OP_SERVICE_ACCOUNT_TOKEN` in env. Auto on agent-devbox + openclaw; host
 
 ## DBs
 
-- `garmin` — sleep, HR, HRV, stress, body battery, steps, activities. [pipelines/docs/NOTES.md](../../../home/ankit/hroot/devserver/pipelines/docs/NOTES.md).
-- `pipeline_dagster` — Dagster orchestrator state.
+- `pipeline_dagster` — **main data source** (and Dagster orchestrator state). Garmin (`sleep`, `heart_rate`, `hrv`, `stress`, `body_battery`, `steps`, `training_readiness`, `derived_daily`, `rolling_7d`, `rolling_30d`), banking (`transactions`, `bank_imports`, `bank_pending`), Playnite (`playnite_sessions`), anomaly + landing-zone tables. [pipelines/docs/NOTES.md](../../../home/ankit/hroot/devserver/pipelines/docs/NOTES.md).
+- `garmin` — legacy subset; not authoritative. Prefer `pipeline_dagster`.
 - `pipeline_dbos` — DBOS user app tables.
 - `pipeline_dbos_dbos_sys` — DBOS system; do not touch.
 - `pipeline_restate` — Restate engine state.
