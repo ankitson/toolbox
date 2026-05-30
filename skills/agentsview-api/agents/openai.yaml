@@ -1,0 +1,4 @@
+interface:
+  display_name: "AgentsView API"
+  short_description: "Query, search, and export coding-agent sessions via HTTP"
+  default_prompt: "Use the AgentsView HTTP API to search across all coding-agent sessions or export a full transcript of a specific session"
