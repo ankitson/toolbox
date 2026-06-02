@@ -9,6 +9,8 @@ import subprocess
 import sys
 import time
 
+SUBMIT_DELAY_SECONDS = 0.1
+
 parser = argparse.ArgumentParser(description="Automate WezTerm input at a specific time.")
 parser.add_argument("pane", help="Target WezTerm Pane ID")
 parser.add_argument("-t", "--time", default="03:45", help="Target time (e.g., 00:30, 12:30AM, 3:45)")
@@ -38,11 +40,18 @@ wait = (target - now).total_seconds()
 print(f"Sleeping {wait/60:.1f}m until {target.strftime('%I:%M %p')} to send '{args.cmd}'...")
 time.sleep(wait)
 
-res = subprocess.run(
-    ["wezterm", "cli", "send-text", "--pane-id", args.pane, "--no-paste", f"{args.cmd}\r"],
-    capture_output=True
-)
 
-if res.returncode != 0:
-    sys.exit(f"WezTerm Error: {res.stderr.decode().strip()}")
+def send_text(text):
+    res = subprocess.run(
+        ["wezterm", "cli", "send-text", "--pane-id", args.pane, "--no-paste", text],
+        capture_output=True,
+    )
+
+    if res.returncode != 0:
+        sys.exit(f"WezTerm Error: {res.stderr.decode().strip()}")
+
+
+send_text(args.cmd)
+time.sleep(SUBMIT_DELAY_SECONDS)
+send_text("\r")
 print("Success.")

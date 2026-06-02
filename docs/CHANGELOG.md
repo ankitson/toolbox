@@ -32,6 +32,11 @@
 
 ## 2026-06-02
 
+### Resume-session submit handling
+- Changed `bin/resume-session` to send scheduled prompt text and the submit
+  carriage return separately, with a short delay between writes.
+- Added a regression test and a `just test-resume-session` command.
+
 ### Simplify skill registry
 - Replaced `skills.json` with `skills.toml`, listing external Git sources only.
 - Reduced `bin/skillctl` to add, sync, list, and check copied snapshots.

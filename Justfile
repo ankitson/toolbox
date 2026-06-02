@@ -18,3 +18,7 @@ skills-add source *args:
 
 # Kept as a short alias for interactive use.
 list: skills-list
+
+# Run the focused regression test for the scheduled WezTerm sender.
+test-resume-session:
+  python -B -m unittest discover -s bin/tests -v

@@ -54,6 +54,18 @@
 - Leave `skills/.system/` outside the manifest because Codex owns that hidden
   subtree and updates it independently.
 
+## 2026-06-02 — Resume-session submit handling
+
+### Discovery
+- `wezterm cli send-text` injects text rather than a dedicated key event.
+- Sending a Claude Code prompt and `\r` in one write can populate the input box
+  without submitting it.
+
+### Change
+- Send prompt text and the submit carriage return as separate direct writes,
+  with a short delay so the terminal UI processes them independently.
+- Added a focused regression test and `just test-resume-session`.
+
 ## 2026-06-02 — Simplified external skill registry
 
 ### Decision
