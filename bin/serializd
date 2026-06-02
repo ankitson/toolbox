@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["requests"]
+# ///
 import json, os, sys, argparse, textwrap, re
 from pathlib import Path
 from difflib import SequenceMatcher

@@ -1,0 +1,48 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+import argparse
+import datetime
+import subprocess
+import sys
+import time
+
+parser = argparse.ArgumentParser(description="Automate WezTerm input at a specific time.")
+parser.add_argument("pane", help="Target WezTerm Pane ID")
+parser.add_argument("-t", "--time", default="03:45", help="Target time (e.g., 00:30, 12:30AM, 3:45)")
+parser.add_argument("-c", "--cmd", default="continue", help="Command text to send")
+args = parser.parse_args()
+
+# Clean up input and try parsing 12-hour AM/PM first, then fall back to 24-hour
+time_str = args.time.upper().replace(" ", "")
+parsed_time = None
+
+for fmt in ("%I:%M%p", "%H:%M"):
+    try:
+        parsed_time = datetime.datetime.strptime(time_str, fmt).time()
+        break
+    except ValueError:
+        continue
+
+if not parsed_time:
+    sys.exit("Error: Use HH:MM (24h) or HH:MM AM/PM format.")
+
+now = datetime.datetime.now()
+target = now.replace(hour=parsed_time.hour, minute=parsed_time.minute, second=0, microsecond=0)
+if target < now:
+    target += datetime.timedelta(days=1)
+
+wait = (target - now).total_seconds()
+print(f"Sleeping {wait/60:.1f}m until {target.strftime('%I:%M %p')} to send '{args.cmd}'...")
+time.sleep(wait)
+
+res = subprocess.run(
+    ["wezterm", "cli", "send-text", "--pane-id", args.pane, "--no-paste", f"{args.cmd}\r"],
+    capture_output=True
+)
+
+if res.returncode != 0:
+    sys.exit(f"WezTerm Error: {res.stderr.decode().strip()}")
+print("Success.")
