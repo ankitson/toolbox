@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""Manage external skill snapshots copied into the canonical skills tree."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+SKILL_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+class SkillctlError(RuntimeError):
+    """An expected user-facing failure."""
+
+
+def run(*args: str, cwd: Path | None = None) -> str:
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=cwd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise SkillctlError(f"required command not found: {args[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or exc.stdout.strip()
+        raise SkillctlError(f"{' '.join(args)} failed: {detail}") from exc
+    return completed.stdout.strip()
+
+
+class SkillManager:
+    def __init__(self, root: Path) -> None:
+        self.root = root.resolve()
+        self.registry_path = self.root / "skills.toml"
+        self.skills_dir = self.root / "skills"
+        self.sources = self.load_registry()
+
+    def load_registry(self) -> dict[str, dict[str, Any]]:
+        if not self.registry_path.exists():
+            return {}
+        try:
+            return self.parse_registry(self.registry_path.read_text())
+        except (OSError, ValueError) as exc:
+            raise SkillctlError(f"cannot read {self.registry_path}: {exc}") from exc
+
+    @staticmethod
+    def parse_registry(content: str) -> dict[str, dict[str, Any]]:
+        """Parse the small TOML subset emitted by save_registry."""
+        sources: dict[str, dict[str, Any]] = {}
+        current: dict[str, Any] | None = None
+        for line_number, raw_line in enumerate(content.splitlines(), 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            table = re.fullmatch(r"\[skills\.([a-z0-9][a-z0-9_-]*)\]", line)
+            if table:
+                name = table.group(1)
+                if name in sources:
+                    raise ValueError(f"line {line_number}: duplicate skill table {name!r}")
+                current = sources.setdefault(name, {})
+                continue
+            if current is None:
+                raise ValueError(f"line {line_number}: expected [skills.<name>] table")
+            assignment = re.fullmatch(r"([a-z]+)\s*=\s*(.+)", line)
+            if not assignment:
+                raise ValueError(f"line {line_number}: expected key = value")
+            key, value = assignment.groups()
+            if key in current:
+                raise ValueError(f"line {line_number}: duplicate key {key!r}")
+            try:
+                current[key] = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"line {line_number}: value must use TOML basic strings or arrays") from exc
+        return sources
+
+    def save_registry(self) -> None:
+        lines = [
+            "# External skill sources copied into skills/ by bin/skillctl sync.",
+            "# Any skill directory not listed here is custom and edited locally.",
+        ]
+        for name, source in sorted(self.sources.items()):
+            lines.extend(["", f"[skills.{name}]"])
+            for key in ("repo", "ref", "path", "files"):
+                if key in source:
+                    lines.append(f"{key} = {json.dumps(source[key])}")
+        self.registry_path.write_text("\n".join(lines) + "\n")
+
+    @staticmethod
+    def validate_name(name: str) -> None:
+        if not SKILL_NAME.fullmatch(name) or name.startswith("."):
+            raise SkillctlError(f"invalid skill name: {name!r}")
+
+    @staticmethod
+    def repo_url(repo: str) -> str:
+        if re.fullmatch(r"[^/:@\s]+/[^/\s]+", repo):
+            return f"https://github.com/{repo}.git"
+        return repo
+
+    @staticmethod
+    def child_path(parent: Path, relative: str, label: str) -> Path:
+        candidate = (parent / relative).resolve()
+        try:
+            candidate.relative_to(parent.resolve())
+        except ValueError as exc:
+            raise SkillctlError(f"{label} escapes its source checkout: {relative}") from exc
+        return candidate
+
+    @staticmethod
+    def default_name_from_repo(repo: str) -> str:
+        repo = repo.rstrip("/")
+        repo = repo.removesuffix(".git")
+        name = repo.rsplit("/", 1)[-1]
+        return name
+
+    def resolve_source_dir(self, checkout: Path, name: str, source: dict[str, Any]) -> Path:
+        if source.get("path"):
+            return self.child_path(checkout, source["path"], f"{name}: path")
+
+        candidates = [
+            checkout,
+            checkout / "skills" / name,
+            checkout / name,
+        ]
+        for candidate in candidates:
+            if (candidate / "SKILL.md").is_file():
+                return candidate
+
+        discovered: list[Path] = []
+        for parent in (checkout / "skills", checkout):
+            if not parent.is_dir():
+                continue
+            for child in parent.iterdir():
+                if child.is_dir() and not child.name.startswith(".") and (child / "SKILL.md").is_file():
+                    discovered.append(child)
+        unique = sorted(set(discovered))
+        if len(unique) == 1:
+            return unique[0]
+        if not unique:
+            raise SkillctlError(
+                f"{name}: could not find SKILL.md at repo root, skills/{name}, or {name}"
+            )
+        choices = ", ".join(str(path.relative_to(checkout)) for path in unique)
+        raise SkillctlError(f"{name}: multiple skill folders found; pass a path ({choices})")
+
+    def validate_source(self, name: str, source: Any) -> list[str]:
+        errors: list[str] = []
+        try:
+            self.validate_name(name)
+        except SkillctlError as exc:
+            return [str(exc)]
+        if not isinstance(source, dict):
+            return [f"{name}: source must be a TOML table"]
+        allowed = {"repo", "ref", "path", "files"}
+        unknown = sorted(set(source) - allowed)
+        if unknown:
+            errors.append(f"{name}: unknown keys: {', '.join(unknown)}")
+        if not isinstance(source.get("repo"), str) or not source["repo"]:
+            errors.append(f"{name}: repo must be a non-empty string")
+        for key in ("ref", "path"):
+            if key in source and (not isinstance(source[key], str) or not source[key]):
+                errors.append(f"{name}: {key} must be a non-empty string")
+        if "files" in source:
+            files = source["files"]
+            if (
+                not isinstance(files, list)
+                or not files
+                or not all(isinstance(item, str) and item for item in files)
+            ):
+                errors.append(f"{name}: files must be a non-empty string array")
+        return errors
+
+    def target(self, name: str) -> Path:
+        return self.skills_dir / name
+
+    def add(
+        self,
+        source_arg: str,
+        repo_arg: str | None,
+        ref: str,
+        path: str | None,
+        files: list[str],
+    ) -> None:
+        if repo_arg is None:
+            repo = source_arg
+            name = self.default_name_from_repo(repo)
+        else:
+            name = source_arg
+            repo = repo_arg
+        self.validate_name(name)
+        if name in self.sources:
+            raise SkillctlError(f"external skill already registered: {name}")
+        target = self.target(name)
+        if target.exists() or target.is_symlink():
+            raise SkillctlError(f"refusing to overwrite existing skill: {target}")
+        source: dict[str, Any] = {"repo": repo}
+        if ref != "main":
+            source["ref"] = ref
+        if path not in (None, "", "."):
+            source["path"] = path
+        if files:
+            source["files"] = files
+        errors = self.validate_source(name, source)
+        if errors:
+            raise SkillctlError("\n".join(errors))
+        self.sync_one(name, source)
+        self.sources[name] = source
+        self.save_registry()
+
+    def sync(self, names: list[str]) -> None:
+        selected = names or sorted(self.sources)
+        for name in selected:
+            source = self.sources.get(name)
+            if source is None:
+                raise SkillctlError(f"external skill not registered: {name}")
+            errors = self.validate_source(name, source)
+            if errors:
+                raise SkillctlError("\n".join(errors))
+            self.sync_one(name, source)
+
+    def sync_one(self, name: str, source: dict[str, Any]) -> None:
+        self.skills_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="skillctl-") as temporary:
+            checkout = Path(temporary) / "repo"
+            run("git", "clone", "--quiet", self.repo_url(source["repo"]), str(checkout))
+            run("git", "checkout", "--quiet", "--detach", source.get("ref", "main"), cwd=checkout)
+            revision = run("git", "rev-parse", "HEAD", cwd=checkout)
+            source_dir = self.resolve_source_dir(checkout, name, source)
+            staged = Path(temporary) / "skill"
+            files = source.get("files", [])
+            if files:
+                staged.mkdir()
+                for relative in files:
+                    source_file = self.child_path(source_dir, relative, f"{name}: file")
+                    if not source_file.is_file():
+                        raise SkillctlError(f"{name}: source file not found: {relative}")
+                    destination = self.child_path(staged, relative, f"{name}: file")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_file, destination)
+            else:
+                if not source_dir.is_dir():
+                    raise SkillctlError(f"{name}: source directory not found: {source_dir}")
+                shutil.copytree(source_dir, staged, ignore=shutil.ignore_patterns(".git"))
+            if not (staged / "SKILL.md").is_file():
+                raise SkillctlError(f"{name}: source does not contain SKILL.md")
+            target = self.target(name)
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(staged, target)
+        print(f"synced {name}: {revision[:12]}")
+
+    def list(self) -> None:
+        names = set(self.sources)
+        if self.skills_dir.exists():
+            names.update(path.name for path in self.skills_dir.iterdir() if not path.name.startswith("."))
+        for name in sorted(names):
+            source = self.sources.get(name)
+            if source is None:
+                print(f"{name:<24} custom")
+                continue
+            detail = source.get("repo", "<invalid>")
+            if source.get("path"):
+                detail += f":{source['path']}"
+            else:
+                detail += " (auto)"
+            if not self.target(name).exists():
+                detail += " (missing; run sync)"
+            print(f"{name:<24} external  {detail}")
+
+    def check(self) -> None:
+        errors: list[str] = []
+        if not self.registry_path.exists():
+            errors.append("skills.toml is missing")
+        for name, source in sorted(self.sources.items()):
+            errors.extend(self.validate_source(name, source))
+            target = self.target(name)
+            if not target.exists():
+                errors.append(f"{name}: skills/{name} is missing; run skillctl sync {name}")
+            elif target.is_symlink():
+                errors.append(f"{name}: external snapshot must not be a symlink")
+        if self.skills_dir.exists():
+            for target in sorted(self.skills_dir.iterdir()):
+                if target.name.startswith("."):
+                    continue
+                if not (target / "SKILL.md").is_file():
+                    errors.append(f"{target.name}: SKILL.md is missing")
+        if errors:
+            raise SkillctlError("\n".join(errors))
+        custom_count = 0
+        if self.skills_dir.exists():
+            custom_count = sum(
+                1
+                for target in self.skills_dir.iterdir()
+                if not target.name.startswith(".") and target.name not in self.sources
+            )
+        print(f"ok: {len(self.sources)} external skills, {custom_count} custom skills")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    commands.add_parser("list", help="list external and custom skills")
+    commands.add_parser("check", help="validate skills.toml and the skills tree")
+
+    sync = commands.add_parser("sync", help="refresh registered external skill snapshots")
+    sync.add_argument("names", nargs="*")
+
+    add = commands.add_parser("add", help="register and sync an external skill")
+    add.add_argument("source", help="owner/repo, git URL, or explicit skill name")
+    add.add_argument("repo", nargs="?", help="repo when the first argument is an explicit name")
+    add.add_argument("path", nargs="?", help="optional skill path inside the repo")
+    add.add_argument("--ref", default="main")
+    add.add_argument("--file", action="append", default=[])
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        manager = SkillManager(args.root)
+        if args.command == "list":
+            manager.list()
+        elif args.command == "check":
+            manager.check()
+        elif args.command == "sync":
+            manager.sync(args.names)
+        elif args.command == "add":
+            manager.add(args.source, args.repo, args.ref, args.path, args.file)
+    except SkillctlError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

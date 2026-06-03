@@ -9,8 +9,8 @@ Universal portable tooling that follows me everywhere — skills and helper CLIs
   chezmoi's `run_once_after_link-toolbox-bins.sh` on every machine.
 - `AGENTS.md` — universal personal instructions. Exposed to agents through
   `~/.agents` and per-agent symlinks.
-- `.skill-lock.json` — provenance for third-party skills installed with the
-  `skills` npm package.
+- `skills.toml` — external skill sources copied into the canonical tree.
+- `bin/skillctl` — adds, refreshes, lists, and validates external snapshots.
 - `docs/` — notes and changelog for maintenance decisions.
 
 ## How it reaches machines
@@ -37,31 +37,45 @@ image symlinks.
 If the tool is env-tied (only makes sense on the homeserver, only in the devbox
 container, etc.), it doesn't belong here — put it in the env's own repo.
 
-## Adding a new skill
+## Managing skills
 
-Skills are plain files. Every agent already sees `skills/` through chezmoi
-symlinks, so **committing the files is the only distribution step** — there is no
-per-agent installer to run. (We deliberately don't use `npx skills` / similar
-multi-agent installers: they fan out copies into each agent's skill dir, which
-here are all symlinks to this one directory — they'd fight the symlinks for no
-benefit.)
+Distribution is a separate concern: `devdocker/dotfiles` chezmoi wiring exposes
+this canonical `skills/` tree to every agent runtime. `skillctl` only refreshes
+external snapshots.
 
-**Authored skill:**
+[`skills.toml`](skills.toml) lists external sources. Any directory under
+`skills/` that is not listed there is custom and edited directly in this repo.
 
-1. Create `skills/<name>/SKILL.md` (`skill-creator` can scaffold one).
-2. Commit and push.
+Common operations:
 
-**Third-party (vendored) skill:**
+```sh
+just skills-list
+just skills-check
+just skills-test
+just skills-sync                         # refresh every external skill
+just skills-sync qmd                     # refresh selected skills
+just skills-add vercel-labs/agent-browser
+just skills-add qmd tobi/qmd skills/qmd  # explicit name/repo/path fallback
+```
 
-1. `just vendor <owner>/<repo> <subpath> <name>` — fetches the skill's directory
-   from the repo into `skills/<name>/`. (For a "tool skill" where the repo is a
-   CLI and you only want `SKILL.md`, copy the file(s) by hand instead.)
-2. Add a row to [`VENDORED.md`](VENDORED.md) recording the source.
-3. Commit and push.
+For selected-file imports or pinned refs, call `bin/skillctl` directly:
 
-Other machines get it on their next `git pull` of this repo (+ a tool install if
-the skill wraps a CLI — see VENDORED.md). Nothing runs an installer except your
-authoring machine, and even there only `git`.
+```sh
+bin/skillctl add rdt-cli public-clis/rdt-cli --file SKILL.md --file SCHEMA.md
+bin/skillctl add example owner/repo path/to/skill --ref v1.0.0
+```
+
+When no path is provided, `skillctl` looks for the same common layouts used by
+skill package repos: repo root `SKILL.md`, `skills/<name>/SKILL.md`,
+`<name>/SKILL.md`, or the only skill folder in the repo. If a repo has multiple
+skills and none matches the name, pass the path explicitly.
+
+Commit `skills.toml` and refreshed skill contents. Chezmoi remains the only
+distribution mechanism. Skills that wrap a CLI still need that CLI installed
+separately; for example, `rdt-cli` requires `uv tool install rdt-cli`.
+
+`skills/.system/` is not managed by `skillctl`: Codex owns and updates that
+hidden subtree.
 
 ## Not part of toolbox
 

@@ -1,0 +1,37 @@
+# External skill sources copied into skills/ by bin/skillctl sync.
+# Any skill directory not listed here is custom and edited locally.
+
+[skills.claude-api]
+repo = "anthropics/skills"
+path = "skills/claude-api"
+
+[skills.grill-me]
+repo = "mattpocock/skills"
+path = "skills/productivity/grill-me"
+
+[skills.grill-with-docs]
+repo = "mattpocock/skills"
+path = "skills/engineering/grill-with-docs"
+
+[skills.qmd]
+repo = "tobi/qmd"
+path = "skills/qmd"
+
+[skills.rdt-cli]
+repo = "public-clis/rdt-cli"
+files = ["SKILL.md", "SCHEMA.md"]
+
+[skills.skill-creator]
+repo = "anthropics/skills"
+path = "skills/skill-creator"
+
+[skills.triage]
+repo = "mattpocock/skills"
+path = "skills/engineering/triage"
+
+[skills.zoom-out]
+repo = "mattpocock/skills"
+path = "skills/engineering/zoom-out"
+
+[skills.agent-browser]
+repo = "vercel-labs/agent-browser"

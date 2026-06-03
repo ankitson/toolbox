@@ -32,3 +32,37 @@
   dependencies"). `rdt-cli` → `uv tool install rdt-cli`.
 - Decide whether the untracked `agent-scripts/` clone (steipete reference repo,
   currently gitignored) should be vendored selectively or removed.
+
+## 2026-06-02 — Declarative skill manager
+
+### Goal
+- Replace hand-maintained vendored-skill provenance rows with a single
+  machine-readable source of truth.
+- Support authored skills, portable vendored snapshots, and local repo-backed
+  symlinks without taking ownership of distribution.
+
+### Decisions
+- `devdocker/dotfiles` chezmoi wiring remains the sole distribution layer.
+- `skills.json` declares managed skills. `bin/skillctl` materializes external
+  sources, validates the live tree, and generates `VENDORED.md`.
+- `custom` skills remain tracked directories authored here.
+- `vendored` skills remain tracked copies suitable for `git pull` portability.
+- Existing vendored snapshots predate source-commit tracking, so their initial
+  manifest revisions are explicitly `unknown` until deliberately refreshed.
+- `repo` skills point into ignored `.skill-repos/` local checkouts and require a
+  local `skillctl sync` after cloning toolbox on a new machine.
+- Leave `skills/.system/` outside the manifest because Codex owns that hidden
+  subtree and updates it independently.
+
+## 2026-06-02 — Simplified external skill registry
+
+### Decision
+- Replace the broad all-skills manager with a shadcn-style TOML registry.
+- `skills.toml` lists external Git sources only. Everything else under `skills/`
+  is implicitly custom and edited directly.
+- External skills are copied snapshots refreshed by `skillctl sync`.
+- Omitted `path` means auto-detect common skill package layouts: repo root,
+  `skills/<name>/`, `<name>/`, or the single obvious skill folder.
+- Remove generated provenance docs, repo-backed symlinks, local clone caches,
+  custom-skill records, revision records, and manager-owned deletion.
+- Chezmoi in `devdocker/dotfiles` remains the sole distribution mechanism.
