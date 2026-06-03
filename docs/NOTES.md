@@ -78,3 +78,39 @@
 - Remove generated provenance docs, repo-backed symlinks, local clone caches,
   custom-skill records, revision records, and manager-owned deletion.
 - Chezmoi in `devdocker/dotfiles` remains the sole distribution mechanism.
+
+## 2026-06-03 — Web clipper
+
+### Goal
+- Add a portable tool and skill that saves a URL as Markdown plus local media.
+- Test first on the All Things Distributed storage-system article, which should
+  produce hundreds of words and multiple images.
+
+### Discovery
+- Steipete's `markdown-converter` skill uses MarkItDown for file/HTML
+  conversion, but does not archive webpage media.
+- Steipete's `browser-use` skill and `browser-tools.ts` are useful references
+  for future rendered-page fallback, but the first implementation should not
+  depend on an interactive browser session.
+- Steipete's `summarize` CLI handles URLs/files/media and extract-only modes,
+  but is summary-oriented rather than a folder-based web archive.
+
+### Initial design
+- Add `bin/web-clip` as a Python CLI.
+- Static-fetch public HTML, choose likely article/main content, convert common
+  HTML structures to Markdown, download image media, and write `index.md`,
+  `source.html`, and `media/`.
+- Add `skills/web-clip` so agents know when and how to use it.
+
+### Verification
+- Local file fixture: Markdown conversion, image download/rewrite, figure
+  captions, links, lists, code, and source HTML preservation.
+- Browser fixture: Playwright-rendered JavaScript page clips correctly outside
+  the sandbox; the sandbox itself blocks Chromium launch.
+- Required article:
+  `allthingsdistributed.com/2023/07/building-and-operating-a-pretty-big-storage-system.html`
+  clipped to ~6.6k words and 9 downloaded images with no mojibake.
+- Extra smoke checks:
+  `docs.python.org/3/library/urllib.parse.html` clipped to ~5.7k words;
+  `aws.amazon.com/blogs/aws/amazon-s3-update-strong-read-after-write-consistency/`
+  clipped to ~700 words and 2 images.

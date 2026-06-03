@@ -45,3 +45,13 @@
 - Treat every unlisted directory under `skills/` as an ordinary custom skill.
 - Added repo-only `skillctl add owner/repo` support with default-path detection
   for root skills, `skills/<name>/`, `<name>/`, and single-skill repos.
+
+### Web clipper
+- Added `bin/web-clip`, a URL-to-Markdown folder clipper that stores `index.md`,
+  fetched `source.html`, and downloaded image media.
+- Added `skills/web-clip` with usage guidance for clipping/archive requests.
+- Added a `just web-clip <url> [output]` recipe.
+- Added file-URL test coverage and optional Playwright `--browser` mode for
+  JavaScript-rendered pages.
+- Verified the required All Things Distributed article, Python docs, and an AWS
+  blog smoke case.

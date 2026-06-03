@@ -1,0 +1,573 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["beautifulsoup4", "requests"]
+# ///
+"""Clip a URL into Markdown plus local media files."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import mimetypes
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import unquote, urljoin, urlparse
+from urllib.request import url2pathname
+
+try:
+    import requests
+    from bs4 import BeautifulSoup, NavigableString, Tag
+except ModuleNotFoundError as exc:
+    print(
+        f"Missing dependency: {exc.name}. Run with `uv run --script bin/web-clip ...` "
+        "or install the dependencies from the PEP 723 header.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125 Safari/537.36 web-clip/1.0"
+)
+NEGATIVE_RE = re.compile(
+    r"comment|combx|contact|foot|footer|masthead|media|meta|nav|outbrain|promo|related|"
+    r"scroll|share|shoutbox|sidebar|sponsor|shopping|tags|tool|widget",
+    re.I,
+)
+POSITIVE_RE = re.compile(r"article|body|content|entry|hentry|main|page|post|story|text", re.I)
+BLOCK_TAGS = {
+    "article",
+    "aside",
+    "blockquote",
+    "body",
+    "div",
+    "dl",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "li",
+    "main",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "ul",
+}
+
+
+@dataclass
+class ClipResult:
+    url: str
+    title: str
+    output_dir: Path
+    markdown_path: Path
+    media_files: list[Path]
+    word_count: int
+
+
+@dataclass
+class MediaStore:
+    base_url: str
+    media_dir: Path
+    session: requests.Session
+    enabled: bool = True
+    max_bytes: int = 25 * 1024 * 1024
+    seen: dict[str, str] = field(default_factory=dict)
+    files: list[Path] = field(default_factory=list)
+
+    def localize(self, source: str, alt: str = "") -> str:
+        source = source.strip()
+        if not self.enabled or not source or source.startswith(("data:", "blob:", "mailto:", "tel:")):
+            return source
+        absolute = urljoin(self.base_url, source)
+        if absolute in self.seen:
+            return self.seen[absolute]
+        parsed = urlparse(absolute)
+        if parsed.scheme == "file":
+            return self.localize_file_url(absolute, alt)
+        try:
+            response = self.session.get(absolute, stream=True, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException:
+            return absolute
+
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip()
+        extension = self.extension_for(absolute, content_type)
+        stem = slugify(Path(unquote(urlparse(absolute).path)).stem or alt or "image")
+        digest = hashlib.sha256(absolute.encode()).hexdigest()[:10]
+        filename = f"{stem}-{digest}{extension}"
+        self.media_dir.mkdir(parents=True, exist_ok=True)
+        target = self.media_dir / filename
+        written = 0
+        try:
+            with target.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > self.max_bytes:
+                        raise ValueError("media too large")
+                    handle.write(chunk)
+        except Exception:
+            target.unlink(missing_ok=True)
+            return absolute
+        relative = f"media/{filename}"
+        self.seen[absolute] = relative
+        self.files.append(target)
+        return relative
+
+    def localize_file_url(self, absolute: str, alt: str = "") -> str:
+        parsed = urlparse(absolute)
+        source_path = Path(url2pathname(parsed.path))
+        if not source_path.is_file():
+            return absolute
+        extension = source_path.suffix or ".bin"
+        stem = slugify(source_path.stem or alt or "image")
+        digest = hashlib.sha256(absolute.encode()).hexdigest()[:10]
+        filename = f"{stem}-{digest}{extension}"
+        self.media_dir.mkdir(parents=True, exist_ok=True)
+        target = self.media_dir / filename
+        try:
+            if source_path.stat().st_size > self.max_bytes:
+                return absolute
+            target.write_bytes(source_path.read_bytes())
+        except OSError:
+            target.unlink(missing_ok=True)
+            return absolute
+        relative = f"media/{filename}"
+        self.seen[absolute] = relative
+        self.files.append(target)
+        return relative
+
+    @staticmethod
+    def extension_for(url: str, content_type: str) -> str:
+        path_extension = Path(urlparse(url).path).suffix.lower()
+        if path_extension and re.fullmatch(r"\.[a-z0-9]{2,5}", path_extension):
+            return path_extension
+        guessed = mimetypes.guess_extension(content_type or "")
+        if guessed == ".jpe":
+            return ".jpg"
+        return guessed or ".bin"
+
+
+def slugify(value: str, fallback: str = "clip") -> str:
+    value = re.sub(r"[^\w\s.-]", "", value, flags=re.UNICODE)
+    value = re.sub(r"[\s_]+", "-", value.strip().lower())
+    value = re.sub(r"-+", "-", value).strip(".-")
+    return value[:90] or fallback
+
+
+def word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w'-]+\b", text))
+
+
+def collapse_blank_lines(markdown: str) -> str:
+    lines = [line.rstrip() for line in markdown.splitlines()]
+    rendered = "\n".join(lines)
+    rendered = re.sub(r"\n{3,}", "\n\n", rendered)
+    rendered = re.sub(r"[ \t]+\n", "\n", rendered)
+    return rendered.strip() + "\n"
+
+
+def fetch_html(url: str, timeout: int) -> tuple[str, str]:
+    parsed = urlparse(url)
+    if parsed.scheme == "file":
+        path = Path(url2pathname(parsed.path))
+        return path.read_text(encoding="utf-8"), path.resolve().as_uri()
+    if parsed.scheme == "" and Path(url).exists():
+        path = Path(url)
+        return path.read_text(encoding="utf-8"), path.resolve().as_uri()
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+    )
+    response = session.get(url, timeout=timeout)
+    response.raise_for_status()
+    declared = (response.encoding or "").lower()
+    apparent = response.apparent_encoding or response.encoding or "utf-8"
+    if declared in {"", "iso-8859-1", "latin-1", "windows-1252"} and apparent:
+        encoding = apparent
+    else:
+        encoding = response.encoding or apparent
+    return response.content.decode(encoding, errors="replace"), response.url
+
+
+def fetch_html_browser(url: str, timeout: int) -> tuple[str, str]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Playwright is not installed; use static mode or install playwright") from exc
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page(user_agent=USER_AGENT)
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(timeout * 1000, 10000))
+            except Exception:
+                pass
+            return page.content(), page.url
+        finally:
+            browser.close()
+
+
+def clean_soup(soup: BeautifulSoup) -> None:
+    for tag in soup.find_all(["script", "style", "noscript", "template", "svg", "canvas", "iframe"]):
+        tag.decompose()
+    for tag in soup.find_all(["nav", "header", "footer", "aside", "form", "button"]):
+        tag.decompose()
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"].strip().lower()
+        text = tag.get_text(" ", strip=True).strip()
+        if href.startswith("javascript:") or (href.startswith("#") and text.startswith("#")):
+            tag.decompose()
+    for tag in soup.find_all(True):
+        hidden = tag.get("hidden")
+        aria_hidden = tag.get("aria-hidden")
+        style = tag.get("style", "")
+        if hidden is not None or aria_hidden == "true" or "display:none" in style.replace(" ", "").lower():
+            tag.decompose()
+
+
+def metadata(soup: BeautifulSoup, url: str) -> dict[str, str]:
+    def meta(*names: str) -> str:
+        for name in names:
+            found = soup.find("meta", attrs={"property": name}) or soup.find("meta", attrs={"name": name})
+            if found and found.get("content"):
+                return found["content"].strip()
+        return ""
+
+    title = meta("og:title", "twitter:title") or (soup.title.get_text(" ", strip=True) if soup.title else "")
+    canonical = ""
+    canonical_tag = soup.find("link", rel=lambda value: value and "canonical" in value)
+    if canonical_tag and canonical_tag.get("href"):
+        canonical = urljoin(url, canonical_tag["href"])
+    return {
+        "title": title or urlparse(url).netloc or "Untitled",
+        "description": meta("description", "og:description", "twitter:description"),
+        "author": meta("author", "article:author"),
+        "published": meta("article:published_time", "date", "pubdate"),
+        "canonical_url": canonical or url,
+    }
+
+
+def score_candidate(tag: Tag) -> float:
+    text = tag.get_text(" ", strip=True)
+    words = word_count(text)
+    if words < 20:
+        return 0
+    paragraphs = tag.find_all("p")
+    images = tag.find_all("img")
+    links_text = " ".join(link.get_text(" ", strip=True) for link in tag.find_all("a"))
+    link_density = len(links_text) / max(len(text), 1)
+    attrs = " ".join(str(tag.get(attr, "")) for attr in ("class", "id", "role"))
+    score = words + len(paragraphs) * 35 + len(images) * 20
+    if POSITIVE_RE.search(attrs):
+        score *= 1.25
+    if NEGATIVE_RE.search(attrs):
+        score *= 0.45
+    if link_density > 0.35:
+        score *= 0.55
+    if tag.name == "article":
+        score *= 1.35
+    if tag.name == "main":
+        score *= 1.2
+    return score
+
+
+def choose_content(soup: BeautifulSoup) -> Tag:
+    preferred = soup.select("article, main, [role='main'], .post, .entry-content, .article-content")
+    candidates = preferred + soup.find_all(["section", "div"])
+    if soup.body:
+        candidates.append(soup.body)
+    candidates = [tag for tag in candidates if isinstance(tag, Tag)]
+    if not candidates:
+        return soup
+    return max(candidates, key=score_candidate)
+
+
+def best_image_source(tag: Tag) -> str:
+    for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+        if tag.get(attr):
+            return tag[attr]
+    srcset = tag.get("srcset") or tag.get("data-srcset")
+    if not srcset:
+        return ""
+    choices: list[tuple[int, str]] = []
+    for item in srcset.split(","):
+        parts = item.strip().split()
+        if not parts:
+            continue
+        weight = 0
+        if len(parts) > 1:
+            match = re.search(r"(\d+)", parts[-1])
+            if match:
+                weight = int(match.group(1))
+        choices.append((weight, parts[0]))
+    if not choices:
+        return ""
+    return sorted(choices)[-1][1]
+
+
+def escape_markdown(text: str) -> str:
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def render_children(tag: Tag, media: MediaStore) -> str:
+    return "".join(render_node(child, media) for child in tag.children)
+
+
+def render_list(tag: Tag, media: MediaStore, ordered: bool) -> str:
+    lines: list[str] = []
+    for index, child in enumerate(tag.find_all("li", recursive=False), 1):
+        body = collapse_blank_lines(render_children(child, media)).strip()
+        body = re.sub(r"\n+", "\n", body)
+        prefix = f"{index}. " if ordered else "- "
+        indented = body.replace("\n", "\n  ")
+        lines.append(prefix + indented)
+    return "\n\n".join(lines) + "\n\n"
+
+
+def render_table(tag: Tag, media: MediaStore) -> str:
+    rows: list[list[str]] = []
+    for tr in tag.find_all("tr"):
+        cells = tr.find_all(["th", "td"], recursive=False)
+        if cells:
+            rows.append([escape_markdown(render_children(cell, media)) for cell in cells])
+    if not rows:
+        return ""
+    width = max(len(row) for row in rows)
+    rows = [row + [""] * (width - len(row)) for row in rows]
+    header = rows[0]
+    output = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join("---" for _ in header) + " |",
+    ]
+    for row in rows[1:]:
+        output.append("| " + " | ".join(row) + " |")
+    return "\n".join(output) + "\n\n"
+
+
+def render_node(node, media: MediaStore) -> str:
+    if isinstance(node, NavigableString):
+        return str(node)
+    if not isinstance(node, Tag):
+        return ""
+    name = node.name.lower()
+    if name in {"script", "style", "noscript", "template"}:
+        return ""
+    if name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+        level = int(name[1])
+        heading = escape_markdown(node.get_text(" ", strip=True))
+        return f"\n\n{'#' * level} {heading}\n\n" if heading else ""
+    if name == "p":
+        return f"\n\n{escape_markdown(render_children(node, media))}\n\n"
+    if name == "br":
+        return "\n"
+    if name == "hr":
+        return "\n\n---\n\n"
+    if name in {"strong", "b"}:
+        body = escape_markdown(render_children(node, media))
+        return f"**{body}**" if body else ""
+    if name in {"em", "i"}:
+        body = escape_markdown(render_children(node, media))
+        return f"*{body}*" if body else ""
+    if name == "code":
+        if node.find_parent("pre"):
+            return node.get_text()
+        return f"`{node.get_text(strip=True)}`"
+    if name == "pre":
+        code = node.get_text("\n").strip("\n")
+        return f"\n\n```\n{code}\n```\n\n"
+    if name == "blockquote":
+        body = collapse_blank_lines(render_children(node, media)).strip()
+        quoted = "\n".join(f"> {line}" if line else ">" for line in body.splitlines())
+        return f"\n\n{quoted}\n\n"
+    if name == "a":
+        label = escape_markdown(render_children(node, media)) or node.get("href", "")
+        href = node.get("href")
+        if not href:
+            return label
+        absolute = urljoin(media.base_url, href)
+        return f"[{label}]({absolute})" if label else absolute
+    if name == "img":
+        src = best_image_source(node)
+        if not src:
+            return ""
+        alt = escape_markdown(node.get("alt", ""))
+        local = media.localize(src, alt)
+        return f"\n\n![{alt}]({local})\n\n"
+    if name == "picture":
+        img = node.find("img")
+        return render_node(img, media) if img else ""
+    if name == "figure":
+        body = "".join(
+            render_node(child, media)
+            for child in node.children
+            if not (isinstance(child, Tag) and child.name.lower() == "figcaption")
+        )
+        caption = node.find("figcaption")
+        if caption:
+            caption_text = escape_markdown(caption.get_text(" ", strip=True))
+            body += f"\n\n*{caption_text}*\n\n"
+        return body
+    if name == "ul":
+        return render_list(node, media, ordered=False)
+    if name == "ol":
+        return render_list(node, media, ordered=True)
+    if name == "table":
+        return render_table(node, media)
+    body = render_children(node, media)
+    if name in BLOCK_TAGS:
+        return f"\n\n{body}\n\n"
+    return body
+
+
+def frontmatter(meta: dict[str, str], original_url: str, final_url: str, words: int) -> str:
+    fields = {
+        "title": meta["title"],
+        "source_url": original_url,
+        "final_url": final_url,
+        "canonical_url": meta.get("canonical_url", final_url),
+        "clipped_at": datetime.now(timezone.utc).isoformat(),
+        "word_count": words,
+    }
+    for key in ("author", "published", "description"):
+        if meta.get(key):
+            fields[key] = meta[key]
+    lines = ["---"]
+    for key, value in fields.items():
+        encoded = json.dumps(value, ensure_ascii=False)
+        lines.append(f"{key}: {encoded}")
+    lines.append("---")
+    return "\n".join(lines) + "\n\n"
+
+
+def unique_output_dir(base: Path, slug: str, overwrite: bool) -> Path:
+    target = base / slug
+    if overwrite or not target.exists():
+        return target
+    for index in range(2, 1000):
+        candidate = base / f"{slug}-{index}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"could not choose unique output directory for {slug}")
+
+
+def clip_url(
+    url: str,
+    output_root: Path,
+    slug: str | None,
+    timeout: int,
+    download_media: bool,
+    overwrite: bool,
+    use_browser: bool,
+) -> ClipResult:
+    if use_browser:
+        html, final_url = fetch_html_browser(url, timeout)
+    else:
+        html, final_url = fetch_html(url, timeout)
+    soup = BeautifulSoup(html, "html.parser")
+    meta = metadata(soup, final_url)
+    clean_soup(soup)
+    content = choose_content(soup)
+
+    folder_slug = slug or slugify(meta["title"], slugify(urlparse(final_url).netloc))
+    output_dir = unique_output_dir(output_root, folder_slug, overwrite)
+    if overwrite and output_dir.exists():
+        for child in output_dir.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+    media = MediaStore(final_url, output_dir / "media", session, enabled=download_media)
+
+    body = collapse_blank_lines(render_node(content, media))
+    if not body.startswith("#"):
+        body = f"# {meta['title']}\n\n{body}"
+    words = word_count(body)
+    markdown = frontmatter(meta, url, final_url, words) + body
+    markdown_path = output_dir / "index.md"
+    markdown_path.write_text(markdown, encoding="utf-8")
+    (output_dir / "source.html").write_text(html, encoding="utf-8")
+    return ClipResult(url, meta["title"], output_dir, markdown_path, media.files, words)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("url", help="URL to clip")
+    parser.add_argument("-o", "--output", type=Path, default=Path("clips"), help="Output root directory")
+    parser.add_argument("--slug", help="Folder slug to use under the output root")
+    parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds")
+    parser.add_argument("--no-media", action="store_true", help="Keep remote image URLs instead of downloading media")
+    parser.add_argument("--browser", action="store_true", help="Render the page with Playwright before clipping")
+    parser.add_argument("--overwrite", action="store_true", help="Replace an existing clip folder with the same slug")
+    parser.add_argument("--json", action="store_true", help="Print machine-readable result details")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        result = clip_url(
+            args.url,
+            args.output,
+            args.slug,
+            args.timeout,
+            download_media=not args.no_media,
+            overwrite=args.overwrite,
+            use_browser=args.browser,
+        )
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "url": result.url,
+                    "title": result.title,
+                    "output_dir": str(result.output_dir),
+                    "markdown_path": str(result.markdown_path),
+                    "media_files": [str(path) for path in result.media_files],
+                    "word_count": result.word_count,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"clipped: {result.markdown_path}")
+        print(f"words: {result.word_count}")
+        print(f"media: {len(result.media_files)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
