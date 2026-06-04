@@ -63,3 +63,13 @@
   JavaScript-rendered pages.
 - Verified the required All Things Distributed article, Python docs, and an AWS
   blog smoke case.
+
+## 2026-06-04
+
+### Cloudflare skills
+- Added Cloudflare's official external skills from `cloudflare/skills`.
+- Registered `cloudflare`, `agents-sdk`, `durable-objects`, `sandbox-sdk`,
+  `wrangler`, `web-perf`, `cloudflare-email-service`, and
+  `workers-best-practices` in `skills.toml`.
+- Copied the skill folders into `skills/` so the existing Codex skills symlink
+  can discover them.

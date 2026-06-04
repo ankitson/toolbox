@@ -133,3 +133,22 @@
   `docs.python.org/3/library/urllib.parse.html` clipped to ~5.7k words;
   `aws.amazon.com/blogs/aws/amazon-s3-update-strong-read-after-write-consistency/`
   clipped to ~700 words and 2 images.
+
+## 2026-06-04 — Cloudflare skill bundle
+
+### Goal
+- Add Cloudflare's official Agent Skills to the canonical toolbox skill tree.
+
+### Discovery
+- `cloudflare/skills` is the official upstream and documents compatibility with
+  OpenAI Codex.
+- The upstream repo has eight actual skill folders under `skills/`: `cloudflare`,
+  `agents-sdk`, `durable-objects`, `sandbox-sdk`, `wrangler`, `web-perf`,
+  `cloudflare-email-service`, and `workers-best-practices`.
+- The README also lists build-agent/build-mcp entries, but those are command
+  folders rather than skill folders.
+
+### Verification
+- Added each Cloudflare skill through `bin/skillctl add` so `skills.toml` can
+  refresh them later.
+- Ran `bin/skillctl check`: 18 external skills, 14 custom skills.
