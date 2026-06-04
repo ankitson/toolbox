@@ -1,5 +1,13 @@
 # Toolbox Changelog
 
+## 2026-06-04
+
+### Summarize CLI integration
+- Added `bin/summarize`, a Node 24+ preflight wrapper around
+  `npx -y @steipete/summarize`.
+- Added `skills/summarize` with terse CLI-only usage guidance for agents.
+- Added `just summarize` and README usage examples.
+
 ## 2026-05-29
 
 ### Skill management cleanup

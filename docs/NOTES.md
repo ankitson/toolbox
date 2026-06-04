@@ -1,5 +1,24 @@
 # Toolbox Notes
 
+## 2026-06-04 — Summarize CLI wrapper
+
+### Goal
+- Integrate steipete/summarize as a portable CLI helper and agent skill.
+
+### Decision
+- Use `npx -y @steipete/summarize` through `bin/summarize` instead of vendoring a
+  binary. This avoids platform-specific artifacts while keeping a stable command
+  in the toolbox PATH.
+- Keep the integration CLI-only. Do not install or configure daemon/browser
+  extension mode unless explicitly requested later.
+- Followed the local `agent-scripts` skill style: short quoted description,
+  terse operational body, no grammar-heavy skill material.
+
+### Verification
+- Confirmed local Node is v24.13.0 and npm is 11.6.2.
+- Ran `bin/summarize --help` outside the sandbox; npm fetched
+  `@steipete/summarize` and the CLI printed help successfully.
+
 ## 2026-05-29 — Third-party skill management
 
 ### What changed

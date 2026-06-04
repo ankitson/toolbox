@@ -25,6 +25,9 @@ skills-add source *args:
 web-clip url output="clips":
   @bin/web-clip {{url}} -o {{output}}
 
+summarize *args:
+  @bin/summarize {{args}}
+
 # Kept as a short alias for interactive use.
 list: skills-list
 

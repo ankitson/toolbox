@@ -65,6 +65,14 @@ bin/skillctl add rdt-cli public-clis/rdt-cli --file SKILL.md --file SCHEMA.md
 bin/skillctl add example owner/repo path/to/skill --ref v1.0.0
 ```
 
+Summarize URLs, files, media, or stdin through the steipete CLI without
+installing its daemon/browser extension:
+
+```sh
+just summarize "https://example.com" --plain
+bin/summarize "/path/to/file.pdf" --length long --plain
+```
+
 When no path is provided, `skillctl` looks for the same common layouts used by
 skill package repos: repo root `SKILL.md`, `skills/<name>/SKILL.md`,
 `<name>/SKILL.md`, or the only skill folder in the repo. If a repo has multiple
