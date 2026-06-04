@@ -100,13 +100,16 @@
 - Static-fetch public HTML, choose likely article/main content, convert common
   HTML structures to Markdown, download image media, and write `index.md`,
   `source.html`, and `media/`.
+- Add Playwright rendered HTML fallback for short static clips or explicit
+  `--rendered always` runs, so JavaScript-heavy pages have a path.
 - Add `skills/web-clip` so agents know when and how to use it.
 
 ### Verification
 - Local file fixture: Markdown conversion, image download/rewrite, figure
   captions, links, lists, code, and source HTML preservation.
-- Browser fixture: Playwright-rendered JavaScript page clips correctly outside
-  the sandbox; the sandbox itself blocks Chromium launch.
+- Browser fixture: Playwright-rendered JavaScript page can be clipped with
+  `--rendered always` outside the sandbox; the sandbox itself blocks Chromium
+  launch.
 - Required article:
   `allthingsdistributed.com/2023/07/building-and-operating-a-pretty-big-storage-system.html`
   clipped to ~6.6k words and 9 downloaded images with no mojibake.
@@ -114,3 +117,27 @@
   `docs.python.org/3/library/urllib.parse.html` clipped to ~5.7k words;
   `aws.amazon.com/blogs/aws/amazon-s3-update-strong-read-after-write-consistency/`
   clipped to ~700 words and 2 images.
+
+## 2026-06-03 — Web clipper Defuddle comparison
+
+### Comparison
+- Compared against the local Defuddle checkout at
+  `/home/ankit/hroot/projects/external-repo/defuddle` and the published
+  `defuddle@0.18.1` CLI.
+- Defuddle is a stronger article-extraction and Markdown-normalization library:
+  it has dedicated handling for metadata, schema.org, footnotes, math, code
+  blocks, layout tables, site-specific extractors, and responsive/lazy images.
+- The toolbox `web-clip` tool has a different job: save a durable folder with
+  `index.md`, `source.html`, and downloaded local media. Defuddle emits clean
+  Markdown/metadata, but its CLI keeps image URLs remote.
+- On the required All Things Distributed S3 article, both tools extracted the
+  same article body shape. Defuddle produced ~6.6k Markdown words and 10 remote
+  image references; `web-clip` produced ~6.7k Markdown words and 9 downloaded
+  local image files.
+
+### Follow-up changes
+- Updated `web-clip` image selection to prefer the best `srcset` candidate over
+  a small fallback `src`, using a parser that tolerates CDN URLs with commas.
+- Preserved image fallbacks from `noscript` before removing non-content tags, so
+  lazy-image pages do not lose their real image assets.
+- Added focused tests for `srcset` selection and `noscript` image preservation.

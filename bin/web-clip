@@ -11,7 +11,9 @@ import argparse
 import hashlib
 import json
 import mimetypes
+import os
 import re
+import shutil
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -213,14 +215,17 @@ def fetch_html(url: str, timeout: int) -> tuple[str, str]:
     return response.content.decode(encoding, errors="replace"), response.url
 
 
-def fetch_html_browser(url: str, timeout: int) -> tuple[str, str]:
+def fetch_rendered_html(url: str, timeout: int, wait_ms: int) -> tuple[str, str]:
     try:
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError as exc:
-        raise RuntimeError("Playwright is not installed; use static mode or install playwright") from exc
+        raise RuntimeError("Playwright is not installed; use --rendered never or install playwright") from exc
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+        browser = playwright.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        )
         try:
             page = browser.new_page(user_agent=USER_AGENT)
             page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
@@ -228,12 +233,19 @@ def fetch_html_browser(url: str, timeout: int) -> tuple[str, str]:
                 page.wait_for_load_state("networkidle", timeout=min(timeout * 1000, 10000))
             except Exception:
                 pass
+            if wait_ms > 0:
+                page.wait_for_timeout(wait_ms)
+            for fraction in (0.25, 0.5, 0.75, 1.0):
+                page.evaluate("(fraction) => window.scrollTo(0, document.body.scrollHeight * fraction)", fraction)
+                page.wait_for_timeout(150)
+            page.evaluate("() => window.scrollTo(0, 0)")
             return page.content(), page.url
         finally:
             browser.close()
 
 
 def clean_soup(soup: BeautifulSoup) -> None:
+    preserve_noscript_images(soup)
     for tag in soup.find_all(["script", "style", "noscript", "template", "svg", "canvas", "iframe"]):
         tag.decompose()
     for tag in soup.find_all(["nav", "header", "footer", "aside", "form", "button"]):
@@ -249,6 +261,19 @@ def clean_soup(soup: BeautifulSoup) -> None:
         style = tag.get("style", "")
         if hidden is not None or aria_hidden == "true" or "display:none" in style.replace(" ", "").lower():
             tag.decompose()
+
+
+def preserve_noscript_images(soup: BeautifulSoup) -> None:
+    for noscript in list(soup.find_all("noscript")):
+        html = noscript.decode_contents()
+        if "<img" not in html.lower() and "<picture" not in html.lower():
+            continue
+        fallback = BeautifulSoup(html, "html.parser")
+        if not fallback.find(["img", "picture"]):
+            continue
+        for child in list(fallback.contents):
+            noscript.insert_before(child)
+        noscript.decompose()
 
 
 def metadata(soup: BeautifulSoup, url: str) -> dict[str, str]:
@@ -308,27 +333,36 @@ def choose_content(soup: BeautifulSoup) -> Tag:
     return max(candidates, key=score_candidate)
 
 
+def best_srcset_source(srcset: str) -> str:
+    choices: list[tuple[int, str]] = []
+    url_parts: list[str] = []
+    for token in srcset.strip().split():
+        width = re.fullmatch(r"(\d+)w,?", token)
+        density = re.fullmatch(r"(\d+(?:\.\d+)?)x,?", token)
+        if width or density:
+            if url_parts:
+                score = int(width.group(1)) if width else int(float(density.group(1)) * 1000)
+                choices.append((score, " ".join(url_parts).strip(" ,")))
+            url_parts = []
+        else:
+            url_parts.append(token)
+    if url_parts:
+        choices.append((0, " ".join(url_parts).strip(" ,")))
+    if not choices and "," in srcset:
+        choices = [(index, item.strip().split()[0]) for index, item in enumerate(srcset.split(",")) if item.strip()]
+    return sorted(choices)[-1][1]
+
+
 def best_image_source(tag: Tag) -> str:
-    for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+    srcset = tag.get("srcset") or tag.get("data-srcset")
+    if srcset:
+        source = best_srcset_source(srcset)
+        if source:
+            return source
+    for attr in ("data-src", "data-original", "data-lazy-src", "src"):
         if tag.get(attr):
             return tag[attr]
-    srcset = tag.get("srcset") or tag.get("data-srcset")
-    if not srcset:
-        return ""
-    choices: list[tuple[int, str]] = []
-    for item in srcset.split(","):
-        parts = item.strip().split()
-        if not parts:
-            continue
-        weight = 0
-        if len(parts) > 1:
-            match = re.search(r"(\d+)", parts[-1])
-            if match:
-                weight = int(match.group(1))
-        choices.append((weight, parts[0]))
-    if not choices:
-        return ""
-    return sorted(choices)[-1][1]
+    return ""
 
 
 def escape_markdown(text: str) -> str:
@@ -422,6 +456,10 @@ def render_node(node, media: MediaStore) -> str:
         return f"\n\n![{alt}]({local})\n\n"
     if name == "picture":
         img = node.find("img")
+        if img and not (img.get("srcset") or img.get("data-srcset")):
+            source = node.find("source", srcset=True) or node.find("source", attrs={"data-srcset": True})
+            if source:
+                img["srcset"] = source.get("srcset") or source.get("data-srcset")
         return render_node(img, media) if img else ""
     if name == "figure":
         body = "".join(
@@ -454,6 +492,7 @@ def frontmatter(meta: dict[str, str], original_url: str, final_url: str, words: 
         "canonical_url": meta.get("canonical_url", final_url),
         "clipped_at": datetime.now(timezone.utc).isoformat(),
         "word_count": words,
+        "extraction": meta.get("extraction", "static"),
     }
     for key in ("author", "published", "description"):
         if meta.get(key):
@@ -477,6 +516,41 @@ def unique_output_dir(base: Path, slug: str, overwrite: bool) -> Path:
     raise RuntimeError(f"could not choose unique output directory for {slug}")
 
 
+def render_markdown_from_html(
+    html: str,
+    original_url: str,
+    final_url: str,
+    output_dir: Path,
+    download_media: bool,
+    extraction: str,
+) -> tuple[str, dict[str, str], list[Path], int]:
+    soup = BeautifulSoup(html, "html.parser")
+    meta = metadata(soup, final_url)
+    meta["extraction"] = extraction
+    clean_soup(soup)
+    content = choose_content(soup)
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+    media = MediaStore(final_url, output_dir / "media", session, enabled=download_media)
+    body = collapse_blank_lines(render_node(content, media))
+    if not body.startswith("#"):
+        body = f"# {meta['title']}\n\n{body}"
+    words = word_count(body)
+    return frontmatter(meta, original_url, final_url, words) + body, meta, media.files, words
+
+
+def preview_word_count(html: str, final_url: str) -> int:
+    markdown, _, _, words = render_markdown_from_html(
+        html,
+        final_url,
+        final_url,
+        Path(os.devnull),
+        download_media=False,
+        extraction="preview",
+    )
+    return words
+
+
 def clip_url(
     url: str,
     output_root: Path,
@@ -484,16 +558,22 @@ def clip_url(
     timeout: int,
     download_media: bool,
     overwrite: bool,
-    use_browser: bool,
+    rendered: str,
+    min_words: int,
+    wait_ms: int,
 ) -> ClipResult:
-    if use_browser:
-        html, final_url = fetch_html_browser(url, timeout)
-    else:
-        html, final_url = fetch_html(url, timeout)
-    soup = BeautifulSoup(html, "html.parser")
-    meta = metadata(soup, final_url)
-    clean_soup(soup)
-    content = choose_content(soup)
+    html, final_url = fetch_html(url, timeout)
+    extraction = "static"
+    if rendered == "always" or (rendered == "auto" and preview_word_count(html, final_url) < min_words):
+        try:
+            html, final_url = fetch_rendered_html(url, timeout, wait_ms)
+            extraction = "rendered"
+        except Exception as exc:
+            if rendered == "always":
+                raise
+            print(f"warning: rendered fallback failed; using static HTML: {exc}", file=sys.stderr)
+
+    meta = metadata(BeautifulSoup(html, "html.parser"), final_url)
 
     folder_slug = slug or slugify(meta["title"], slugify(urlparse(final_url).netloc))
     output_dir = unique_output_dir(output_root, folder_slug, overwrite)
@@ -504,19 +584,18 @@ def clip_url(
             else:
                 child.unlink()
     output_dir.mkdir(parents=True, exist_ok=True)
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-    media = MediaStore(final_url, output_dir / "media", session, enabled=download_media)
-
-    body = collapse_blank_lines(render_node(content, media))
-    if not body.startswith("#"):
-        body = f"# {meta['title']}\n\n{body}"
-    words = word_count(body)
-    markdown = frontmatter(meta, url, final_url, words) + body
+    markdown, meta, media_files, words = render_markdown_from_html(
+        html,
+        url,
+        final_url,
+        output_dir,
+        download_media=download_media,
+        extraction=extraction,
+    )
     markdown_path = output_dir / "index.md"
     markdown_path.write_text(markdown, encoding="utf-8")
     (output_dir / "source.html").write_text(html, encoding="utf-8")
-    return ClipResult(url, meta["title"], output_dir, markdown_path, media.files, words)
+    return ClipResult(url, meta["title"], output_dir, markdown_path, media_files, words)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -525,8 +604,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-o", "--output", type=Path, default=Path("clips"), help="Output root directory")
     parser.add_argument("--slug", help="Folder slug to use under the output root")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds")
+    parser.add_argument(
+        "--rendered",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Use Playwright-rendered HTML never, always, or when static extraction is short",
+    )
+    parser.add_argument("--min-words", type=int, default=200, help="Rendered fallback threshold for --rendered auto")
+    parser.add_argument("--wait-ms", type=int, default=1000, help="Extra wait after rendered page load")
     parser.add_argument("--no-media", action="store_true", help="Keep remote image URLs instead of downloading media")
-    parser.add_argument("--browser", action="store_true", help="Render the page with Playwright before clipping")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing clip folder with the same slug")
     parser.add_argument("--json", action="store_true", help="Print machine-readable result details")
     return parser
@@ -542,7 +628,9 @@ def main() -> int:
             args.timeout,
             download_media=not args.no_media,
             overwrite=args.overwrite,
-            use_browser=args.browser,
+            rendered=args.rendered,
+            min_words=args.min_words,
+            wait_ms=args.wait_ms,
         )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)

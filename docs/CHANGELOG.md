@@ -51,7 +51,10 @@
   fetched `source.html`, and downloaded image media.
 - Added `skills/web-clip` with usage guidance for clipping/archive requests.
 - Added a `just web-clip <url> [output]` recipe.
-- Added file-URL test coverage and optional Playwright `--browser` mode for
+- Added file-URL test coverage and optional Playwright `--rendered` modes for
   JavaScript-rendered pages.
 - Verified the required All Things Distributed article, Python docs, and an AWS
   blog smoke case.
+- Compared against Defuddle and improved image handling: responsive `srcset`
+  candidates now beat tiny fallback `src` values, CDN URLs with commas are
+  tolerated, and `noscript` lazy-image fallbacks are preserved before cleanup.
