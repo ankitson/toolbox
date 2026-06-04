@@ -1,6 +1,13 @@
 # External skill sources copied into skills/ by bin/skillctl sync.
 # Any skill directory not listed here is custom and edited locally.
 
+[skills.agent-browser]
+repo = "vercel-labs/agent-browser"
+
+[skills.autoreview]
+repo = "openclaw/agent-skills"
+path = "skills/autoreview"
+
 [skills.claude-api]
 repo = "anthropics/skills"
 path = "skills/claude-api"
@@ -32,6 +39,3 @@ path = "skills/engineering/triage"
 [skills.zoom-out]
 repo = "mattpocock/skills"
 path = "skills/engineering/zoom-out"
-
-[skills.agent-browser]
-repo = "vercel-labs/agent-browser"
