@@ -26,7 +26,7 @@ Why: cross-repo work interleaves. Good history groups by intent (shared tool + i
 3. Read diffs: `git -C R diff` / `--staged` / `status --porcelain`. grasp the story, not filenames. skim untracked.
 4. Group: feature = one intent (what it accomplishes). cross-repo same intent = 1 feature -> 1 commit/repo, parallel msgs, kept adjacent. unrelated changes same repo = separate commits. don't collapse two stories into "it's all in R/".
 5. Order: foundational/shared first, docs/cleanup last, cross-repo sets together. show numbered list as orientation (not a gate).
-6. Gate each commit, before staging: show repo+branch (flag `main`), proposed msg, diff for exactly its paths (`git -C R diff -- PATHS`; untracked shown as new). big/generated diff -> `--stat` + excerpt, offer full. then wait: `approve` / `edit msg` / `split` / `skip` / `stop`. stage only at approve -> skip/stop leaves tree as found. date commit to mtime when clear (see Commit date).
+6. Gate each commit, before staging: show repo+branch (flag `main`), proposed msg, diff for exactly its paths (`git -C R diff -- PATHS`; untracked shown as new). big/generated diff -> `--stat` + excerpt, offer full. then wait: `approve` / `edit msg` / `split` / `skip` / `stop`. stage only at approve -> skip/stop leaves tree as found. date commit to mtime when clear (see Commit date). derive PATHS from `git status --porcelain`, not memory; after commit confirm no feature files left dangling (a left-behind file = likely a missed path).
 7. Wrap: recap per repo (commit subjects) + what left uncommitted (skipped/junk/flagged secrets). remind: nothing pushed; review via `git -C R log`/`show`.
 
 ## Entangled file (common, dangerous)
@@ -68,5 +68,5 @@ Ex (split unrelated in 1 repo): `feat(systemd): run opencode + codex as user ser
 - detached HEAD (`branch:"HEAD"`): flag, confirm before commit.
 - merge/rebase/cherry-pick in progress (`in_progress` set): don't stack; user resolves first.
 - pre-staged changes: fold into relevant preview, not blind commit.
-- submodules: scanner stops at outer repo; pointer moved -> mention, don't commit inside unless asked.
+- submodules: scanner stops at outer repo; don't commit inside unless asked. submodule pointer bump = ALWAYS its own commit, never mixed with other changes (`chore: bump <name> submodule`).
 - empty scope after filter: say so, stop. don't widen alone.
