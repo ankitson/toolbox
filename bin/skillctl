@@ -15,6 +15,25 @@ from typing import Any
 
 
 SKILL_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+GLOB_SOURCE_MARKER = ".skillctl-source"
+GLOB_CHARS = frozenset("*?[{")
+
+
+def _is_glob(path: str) -> bool:
+    return any(c in path for c in GLOB_CHARS)
+
+
+def _expand_braces(pattern: str) -> list[str]:
+    """Expand one level of {a,b,c} brace syntax into multiple patterns."""
+    m = re.search(r"\{([^{}]+)\}", pattern)
+    if not m:
+        return [pattern]
+    prefix, suffix = pattern[: m.start()], pattern[m.end():]
+    alts = [a.strip() for a in m.group(1).split(",")]
+    result: list[str] = []
+    for alt in alts:
+        result.extend(_expand_braces(prefix + alt + suffix))
+    return result
 
 
 class SkillctlError(RuntimeError):
@@ -153,6 +172,33 @@ class SkillManager:
         choices = ", ".join(str(path.relative_to(checkout)) for path in unique)
         raise SkillctlError(f"{name}: multiple skill folders found; pass a path ({choices})")
 
+    def resolve_glob_dirs(self, checkout: Path, label: str, source: dict[str, Any]) -> list[tuple[str, Path]]:
+        """Expand brace patterns and glob to find all matched (skill_name, skill_dir) pairs."""
+        pattern = source["path"]
+        expanded_patterns = _expand_braces(pattern)
+        results: list[tuple[str, Path]] = []
+        for pat in expanded_patterns:
+            for matched in sorted(checkout.glob(pat)):
+                if matched.is_dir() and (matched / "SKILL.md").is_file():
+                    skill_name = matched.name
+                    results.append((skill_name, matched))
+        if not results:
+            raise SkillctlError(f"{label}: glob pattern {pattern!r} matched no directories with SKILL.md")
+        return results
+
+    def _glob_owned_skills(self, label: str) -> list[str]:
+        """Return skill names whose .skillctl-source marker contains label."""
+        owned: list[str] = []
+        if not self.skills_dir.exists():
+            return owned
+        for skill_dir in self.skills_dir.iterdir():
+            if skill_dir.name.startswith(".") or not skill_dir.is_dir():
+                continue
+            marker = skill_dir / GLOB_SOURCE_MARKER
+            if marker.is_file() and marker.read_text().strip() == label:
+                owned.append(skill_dir.name)
+        return owned
+
     def validate_source(self, name: str, source: Any) -> list[str]:
         errors: list[str] = []
         try:
@@ -178,6 +224,9 @@ class SkillManager:
                 or not all(isinstance(item, str) and item for item in files)
             ):
                 errors.append(f"{name}: files must be a non-empty string array")
+        # Conflict: files + glob path
+        if "files" in source and source.get("path") and _is_glob(source["path"]):
+            errors.append(f"{name}: files cannot be combined with a glob path")
         return errors
 
     def target(self, name: str) -> Path:
@@ -200,9 +249,12 @@ class SkillManager:
         self.validate_name(name)
         if name in self.sources:
             raise SkillctlError(f"external skill already registered: {name}")
-        target = self.target(name)
-        if target.exists() or target.is_symlink():
-            raise SkillctlError(f"refusing to overwrite existing skill: {target}")
+        # Only refuse to overwrite when path is NOT a glob (glob creates multiple dirs, no single target)
+        is_glob_path = path is not None and _is_glob(path)
+        if not is_glob_path:
+            target = self.target(name)
+            if target.exists() or target.is_symlink():
+                raise SkillctlError(f"refusing to overwrite existing skill: {target}")
         source: dict[str, Any] = {"repo": repo}
         if ref != "main":
             source["ref"] = ref
@@ -228,7 +280,40 @@ class SkillManager:
                 raise SkillctlError("\n".join(errors))
             self.sync_one(name, source)
 
-    def sync_one(self, name: str, source: dict[str, Any]) -> None:
+    def _sync_glob(self, label: str, source: dict[str, Any]) -> None:
+        """Sync a glob source entry, installing/updating/removing matched skill dirs."""
+        self.skills_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="skillctl-") as temporary:
+            checkout = Path(temporary) / "repo"
+            run("git", "clone", "--quiet", self.repo_url(source["repo"]), str(checkout))
+            run("git", "checkout", "--quiet", "--detach", source.get("ref", "main"), cwd=checkout)
+            revision = run("git", "rev-parse", "HEAD", cwd=checkout)
+
+            matched = self.resolve_glob_dirs(checkout, label, source)
+            new_names = {skill_name for skill_name, _ in matched}
+
+            # Install/update each matched skill dir
+            for skill_name, source_dir in matched:
+                target = self.target(skill_name)
+                if target.is_symlink() or target.is_file():
+                    target.unlink()
+                elif target.exists():
+                    shutil.rmtree(target)
+                shutil.copytree(source_dir, target, ignore=shutil.ignore_patterns(".git"))
+                # Write the source marker
+                (target / GLOB_SOURCE_MARKER).write_text(label)
+                print(f"synced {skill_name} (from {label}): {revision[:12]}")
+
+            # Remove stale skills previously owned by this label
+            previously_owned = self._glob_owned_skills(label)
+            for stale_name in previously_owned:
+                if stale_name not in new_names:
+                    stale_target = self.target(stale_name)
+                    if stale_target.exists():
+                        shutil.rmtree(stale_target)
+
+    def _sync_single(self, name: str, source: dict[str, Any]) -> None:
+        """Sync a single (non-glob) skill source."""
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="skillctl-") as temporary:
             checkout = Path(temporary) / "repo"
@@ -261,12 +346,41 @@ class SkillManager:
             shutil.copytree(staged, target)
         print(f"synced {name}: {revision[:12]}")
 
+    def sync_one(self, name: str, source: dict[str, Any]) -> None:
+        if _is_glob(source.get("path", "")):
+            self._sync_glob(name, source)
+        else:
+            self._sync_single(name, source)
+
     def list(self) -> None:
+        # Determine which skill dirs are glob-owned
+        glob_owned: set[str] = set()
+        for label, source in self.sources.items():
+            if _is_glob(source.get("path", "")):
+                for skill_name in self._glob_owned_skills(label):
+                    glob_owned.add(skill_name)
+
         names = set(self.sources)
         if self.skills_dir.exists():
             names.update(path.name for path in self.skills_dir.iterdir() if not path.name.startswith("."))
+
         for name in sorted(names):
             source = self.sources.get(name)
+            # Glob source registry entries
+            if source is not None and _is_glob(source.get("path", "")):
+                owned = self._glob_owned_skills(name)
+                n = len(owned)
+                repo = source.get("repo", "<invalid>")
+                pattern = source.get("path", "")
+                if n == 0:
+                    detail = f"{repo}:{pattern} (missing; run sync)"
+                else:
+                    detail = f"{repo}:{pattern} ({n} skills)"
+                print(f"{name:<24} glob      {detail}")
+                continue
+            # Glob-owned skill dirs: skip (don't print as custom)
+            if name in glob_owned:
+                continue
             if source is None:
                 print(f"{name:<24} custom")
                 continue
@@ -283,29 +397,67 @@ class SkillManager:
         errors: list[str] = []
         if not self.registry_path.exists():
             errors.append("skills.toml is missing")
+
+        # Determine which skill dirs are glob-owned
+        glob_owned: set[str] = set()
+        glob_labels: list[str] = []
+        for label, source in sorted(self.sources.items()):
+            if _is_glob(source.get("path", "")):
+                glob_labels.append(label)
+                for skill_name in self._glob_owned_skills(label):
+                    glob_owned.add(skill_name)
+
         for name, source in sorted(self.sources.items()):
             errors.extend(self.validate_source(name, source))
-            target = self.target(name)
-            if not target.exists():
-                errors.append(f"{name}: skills/{name} is missing; run skillctl sync {name}")
-            elif target.is_symlink():
-                errors.append(f"{name}: external snapshot must not be a symlink")
+            if _is_glob(source.get("path", "")):
+                # For glob sources: require at least one owned skill
+                if not self._glob_owned_skills(name):
+                    errors.append(f"{name}: no glob-owned skills found; run skillctl sync {name}")
+            else:
+                target = self.target(name)
+                if not target.exists():
+                    errors.append(f"{name}: skills/{name} is missing; run skillctl sync {name}")
+                elif target.is_symlink():
+                    errors.append(f"{name}: external snapshot must not be a symlink")
+
         if self.skills_dir.exists():
             for target in sorted(self.skills_dir.iterdir()):
                 if target.name.startswith("."):
                     continue
+                # Skip glob-owned dirs in the SKILL.md missing sweep
+                if target.name in glob_owned:
+                    continue
                 if not (target / "SKILL.md").is_file():
                     errors.append(f"{target.name}: SKILL.md is missing")
+
         if errors:
             raise SkillctlError("\n".join(errors))
+
         custom_count = 0
+        glob_skill_count = 0
         if self.skills_dir.exists():
             custom_count = sum(
                 1
                 for target in self.skills_dir.iterdir()
-                if not target.name.startswith(".") and target.name not in self.sources
+                if not target.name.startswith(".")
+                and target.name not in self.sources
+                and target.name not in glob_owned
             )
-        print(f"ok: {len(self.sources)} external skills, {custom_count} custom skills")
+            glob_skill_count = len(glob_owned)
+
+        external_count = sum(
+            1 for s in self.sources.values() if not _is_glob(s.get("path", ""))
+        )
+        glob_source_count = len(glob_labels)
+
+        if glob_source_count == 0:
+            print(f"ok: {external_count} external skills, {custom_count} custom skills")
+        else:
+            print(
+                f"ok: {external_count} external skills, "
+                f"{glob_source_count} glob sources ({glob_skill_count} skills), "
+                f"{custom_count} custom skills"
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
