@@ -234,6 +234,127 @@ class SkillctlTestCase(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("run skillctl sync missing", result.stderr)
 
+    def test_add_glob_star_creates_multiple_skills(self) -> None:
+        repo = self.make_repo(
+            {
+                "skills/alpha/SKILL.md": "# Alpha\n",
+                "skills/beta/SKILL.md": "# Beta\n",
+                "skills/alpha/extra.md": "extra\n",
+            }
+        )
+
+        self.run_command("add", "glob-all", str(repo), "skills/*")
+
+        alpha = self.root / "skills" / "alpha"
+        beta = self.root / "skills" / "beta"
+        self.assertTrue((alpha / "SKILL.md").exists())
+        self.assertTrue((beta / "SKILL.md").exists())
+        self.assertEqual((alpha / ".skillctl-source").read_text().strip(), "glob-all")
+        self.assertEqual((beta / ".skillctl-source").read_text().strip(), "glob-all")
+
+    def test_sync_glob_updates_existing_skills(self) -> None:
+        repo = self.make_repo(
+            {
+                "skills/alpha/SKILL.md": "# Alpha before\n",
+                "skills/beta/SKILL.md": "# Beta\n",
+            }
+        )
+        self.run_command("add", "glob-all", str(repo), "skills/*")
+        self.commit_file(repo, "skills/alpha/SKILL.md", "# Alpha after\n")
+
+        self.run_command("sync", "glob-all")
+
+        self.assertEqual(
+            (self.root / "skills" / "alpha" / "SKILL.md").read_text(),
+            "# Alpha after\n",
+        )
+
+    def test_sync_glob_removes_stale_skills(self) -> None:
+        repo = self.make_repo(
+            {
+                "skills/alpha/SKILL.md": "# Alpha\n",
+                "skills/beta/SKILL.md": "# Beta\n",
+            }
+        )
+        self.run_command("add", "glob-all", str(repo), "skills/*")
+
+        # Remove beta from the repo
+        self.git(repo, "rm", "-r", "skills/beta")
+        self.git(repo, "commit", "--quiet", "-m", "remove beta")
+
+        self.run_command("sync", "glob-all")
+
+        self.assertTrue((self.root / "skills" / "alpha").exists())
+        self.assertFalse((self.root / "skills" / "beta").exists())
+
+    def test_glob_brace_expansion_selects_subset(self) -> None:
+        repo = self.make_repo(
+            {
+                "skills/alpha/SKILL.md": "# Alpha\n",
+                "skills/beta/SKILL.md": "# Beta\n",
+                "skills/gamma/SKILL.md": "# Gamma\n",
+            }
+        )
+
+        self.run_command("add", "subset", str(repo), "skills/{alpha,gamma}")
+
+        self.assertTrue((self.root / "skills" / "alpha" / "SKILL.md").exists())
+        self.assertTrue((self.root / "skills" / "gamma" / "SKILL.md").exists())
+        self.assertFalse((self.root / "skills" / "beta").exists())
+        self.assertEqual(
+            (self.root / "skills" / "alpha" / ".skillctl-source").read_text().strip(),
+            "subset",
+        )
+        self.assertEqual(
+            (self.root / "skills" / "gamma" / ".skillctl-source").read_text().strip(),
+            "subset",
+        )
+
+    def test_list_shows_glob_source(self) -> None:
+        repo = self.make_repo(
+            {
+                "skills/alpha/SKILL.md": "# Alpha\n",
+                "skills/beta/SKILL.md": "# Beta\n",
+            }
+        )
+        self.run_command("add", "glob-all", str(repo), "skills/*")
+
+        result = self.run_command("list")
+
+        self.assertIn("glob", result.stdout)
+        self.assertIn("glob-all", result.stdout)
+        # Individual skill names should NOT appear as separate "custom" rows
+        lines = result.stdout.splitlines()
+        custom_lines = [l for l in lines if "custom" in l]
+        for line in custom_lines:
+            self.assertNotIn("alpha", line)
+            self.assertNotIn("beta", line)
+
+    def test_check_glob_source_fails_before_sync(self) -> None:
+        # Write a skills.toml with a glob entry manually (no sync)
+        (self.root / "skills.toml").write_text(
+            '[skills.glob-source]\nrepo = "owner/repo"\npath = "skills/*"\n'
+        )
+
+        result = self.run_command("check", check=False)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("run skillctl sync", result.stderr)
+
+    def test_check_glob_source_passes_after_sync(self) -> None:
+        repo = self.make_repo(
+            {
+                "skills/alpha/SKILL.md": "# Alpha\n",
+                "skills/beta/SKILL.md": "# Beta\n",
+            }
+        )
+        self.run_command("add", "glob-all", str(repo), "skills/*")
+
+        result = self.run_command("check")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("glob sources", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
