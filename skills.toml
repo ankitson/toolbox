@@ -4,21 +4,17 @@
 [skills.agent-browser]
 repo = "vercel-labs/agent-browser"
 
+[skills.anthropics]
+repo = "anthropics/skills"
+path = "skills/{claude-api,skill-creator}"
+
 [skills.autoreview]
 repo = "openclaw/agent-skills"
 path = "skills/autoreview"
 
-[skills.claude-api]
-repo = "anthropics/skills"
-path = "skills/claude-api"
-
-[skills.grill-me]
+[skills.mattpocock]
 repo = "mattpocock/skills"
-path = "skills/productivity/grill-me"
-
-[skills.grill-with-docs]
-repo = "mattpocock/skills"
-path = "skills/engineering/grill-with-docs"
+path = "skills/{productivity/grill-me,engineering/grill-with-docs,engineering/triage,engineering/zoom-out}"
 
 [skills.qmd]
 repo = "tobi/qmd"
@@ -28,14 +24,6 @@ path = "skills/qmd"
 repo = "public-clis/rdt-cli"
 files = ["SKILL.md", "SCHEMA.md"]
 
-[skills.skill-creator]
-repo = "anthropics/skills"
-path = "skills/skill-creator"
-
-[skills.triage]
-repo = "mattpocock/skills"
-path = "skills/engineering/triage"
-
-[skills.zoom-out]
-repo = "mattpocock/skills"
-path = "skills/engineering/zoom-out"
+[skills.slavingia]
+repo = "slavingia/skills"
+path = "skills/*"
