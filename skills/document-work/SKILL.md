@@ -1,11 +1,12 @@
 ---
 name: document-work
-description: Set up and maintain project documentation following standard conventions. Use at the start of any non-trivial task, when making code changes, or when the user asks to document work.
+description: maintain project docs - standard conventions. use after code changes.
 ---
 
 # Document Work
 
-Follow these conventions whenever doing non-trivial work in a project.
+Follow these conventions whenever doing non-trivial work in a project. 
+Do not document small changes related to temporary uncommitted work
 
 ## Required Structure
 
