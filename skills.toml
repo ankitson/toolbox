@@ -28,6 +28,10 @@ path = "skills/cloudflare-email-service"
 repo = "cloudflare/skills"
 path = "skills/durable-objects"
 
+[skills.last30days]
+repo = "mvanhorn/last30days-skill"
+path = "skills/last30days"
+
 [skills.mattpocock]
 repo = "mattpocock/skills"
 path = "skills/{productivity/grill-me,engineering/grill-with-docs,engineering/triage,engineering/zoom-out}"
