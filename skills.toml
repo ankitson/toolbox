@@ -63,3 +63,6 @@ path = "skills/workers-best-practices"
 [skills.wrangler]
 repo = "cloudflare/skills"
 path = "skills/wrangler"
+
+[skills.webby]
+repo = "ankitson/webby"
