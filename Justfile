@@ -34,3 +34,7 @@ list: skills-list
 # Run the focused regression test for the scheduled WezTerm sender.
 test-resume-session:
   python -B -m unittest discover -s bin/tests -v
+
+# Run the focused regression test for launching Windows Code Insiders.
+test-wined:
+  python -B -m unittest discover -s bin/tests -p 'test_wined.py' -v

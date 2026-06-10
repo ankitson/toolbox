@@ -1,5 +1,30 @@
 # Toolbox Notes
 
+## 2026-06-10 — Wined launcher
+
+### Goal
+- Add a small command that can be run from any directory on this Linux machine
+  to open that directory in VS Code Insiders running on a remote Windows desktop.
+- Name the utility `wined`.
+
+### Decision
+- Use SSH to the Windows host and run a short encoded PowerShell command there.
+- Launch the GUI app through a short-lived interactive scheduled task. Direct
+  `Start-Process` from Windows OpenSSH can run in the SSH service session and
+  never appear on the logged-in desktop.
+- Prefer `Code - Insiders.exe` over `code-insiders.cmd`; the batch wrapper can
+  leave a foreground terminal window behind when launched from the task.
+- Suppress PowerShell progress output and request text output format because
+  Windows OpenSSH can otherwise print CLIXML progress records.
+- Default the Windows SSH host to `ts-desktop-win`, matching the local SSH
+  config, while allowing `CODE_INSIDERS_WINDOWS_HOST` or `--windows-host` to
+  override it.
+- Use VS Code Remote-SSH's CLI shape: `code-insiders --remote
+  ssh-remote+<target> <path>`. The target defaults to this machine's hostname
+  and can be overridden with `CODE_INSIDERS_REMOTE_TARGET` or `--remote-target`.
+- Preserve the shell's logical `$PWD` when it points at the same directory as
+  Python's current working directory, so symlinked project paths remain stable.
+
 ## 2026-06-04 — Summarize CLI wrapper
 
 ### Goal

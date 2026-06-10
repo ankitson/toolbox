@@ -1,5 +1,18 @@
 # Toolbox Changelog
 
+## 2026-06-10
+
+### Wined launcher
+- Added `bin/wined`, which SSHes to a Windows host and starts VS Code
+  Insiders with a Remote-SSH window pointed at the current machine and directory.
+- Changed launch behavior to use a short-lived interactive scheduled task so
+  the app appears in the logged-in Windows desktop session.
+- Preferred the GUI `Code - Insiders.exe` over `code-insiders.cmd` to avoid
+  leaving a foreground terminal window behind.
+- Suppressed PowerShell CLIXML progress noise from Windows OpenSSH.
+- Added focused unit coverage for command construction and argument validation.
+- Added `just test-wined` for the focused regression test.
+
 ## 2026-06-04
 
 ### Summarize CLI integration
