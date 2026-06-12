@@ -87,11 +87,5 @@ hidden subtree.
 
 ## Not part of toolbox
 
-- Env-tied bins → live in env repos (`hroot/homeserver/bin/`, etc.).
-- Agent runtime memory & knowledge → lives in the `cybernetics` Obsidian vault.
+- Env-tied bins → live in env repos 
 - Container/image config → `devdocker`, `devserver`.
-
-## History
-
-Previously named `clankerpedia`. Renamed to `toolbox` to reflect broader scope (skills +
-bins, not just skills).
