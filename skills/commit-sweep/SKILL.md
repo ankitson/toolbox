@@ -9,11 +9,10 @@ Multi-repo commit organizer. Uncommitted work across repos -> grouped feature co
 
 Why: cross-repo work interleaves. Good history groups by intent (shared tool + its adopters = one story, N commits). Recover that; nothing commits unseen.
 
-## Rules (hard)
+
+# Guardrails
 
 - No push. ever. user's call.
-- No branch create/switch; no amend/rebase/reset. commit on current branch (even `main`; flag it, don't override).
-- No `git add -A` / `.`. stage explicit paths or hunks only.
 - No discard: no `checkout --` / `restore` / `clean` / `stash drop`. only add + commit.
 - Respect `.gitignore`. never `-f` ignored paths.
 - Secrets never staged w/o explicit ok: `*.env` `*.pem` `id_*` `*token*` `*secret*` `*.key` `service-account*`.
@@ -39,7 +38,7 @@ Split hunks (no interactive `add -p` here; patch + `apply --cached` does it):
 - `scripts/stage-hunks.py R FILE 1 3`      # stage only those
 - `git -C R commit -m "..."`               # NO pathspec -> only staged hunks land
 
-Cautions: nothing pre-staged first (`git diff --cached`); too interleaved -> hand file back to user.
+Cautions: nothing pre-staged first (`git diff --cached`); too interleaved -> split into finer hunks.
 
 Two of *your own* features tangled in the same hunks: just pick the better-fitting commit. split = your-work-vs-other-work, not hairsplitting your own.
 
