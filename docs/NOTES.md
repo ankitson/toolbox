@@ -1,5 +1,31 @@
 # Toolbox Notes
 
+## 2026-06-11 — Remeddy remote editor launcher
+
+### Goal
+- Turn the remote editor launcher into a generic command that accepts a remote
+  desktop SSH host, detects whether it is macOS or Windows, and opens the
+  current directory via VS Code Remote-SSH.
+
+### Decision
+- Rename the utility to `remeddy` for "remote editor".
+- Use `remeddy <host> [app]` as the main interface. The optional app name
+  defaults to `Visual Studio Code - Insiders`.
+- Default `--platform` to `auto`. Probe macOS with `/usr/bin/uname -s`, then
+  probe Windows with `powershell.exe` if the Unix probe fails.
+- Treat VS Code-like apps (`code`, `codium`, `cursor`) as Remote-SSH editors.
+  Those receive `--remote ssh-remote+<target> <path>` arguments.
+- Treat other apps as ordinary GUI apps. On macOS this means `open -a <app>`;
+  on Windows this means launching the executable without Remote-SSH arguments.
+- For macOS Remote-SSH editors, use the app CLI from PATH or the normal app
+  bundle locations instead of `open -a`, because `open` can simply activate an
+  existing editor window and drop the Remote-SSH folder arguments.
+- Default macOS Remote-SSH editor launches to `--new-window` unless
+  `--reuse-window` is explicitly passed, so an unrelated already-open workspace
+  is not reused accidentally.
+- Keep explicit `--platform windows|macos` for debugging and dry-run cases where
+  probing is not wanted.
+
 ## 2026-06-10 — Wined launcher
 
 ### Goal

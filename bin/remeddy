@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""Open this machine's current directory in a remote desktop editor."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+
+DEFAULT_APP = "Visual Studio Code - Insiders"
+APP_ENV = "REMEDDY_APP"
+LEGACY_REMOTE_TARGET_ENV = "CODE_INSIDERS_REMOTE_TARGET"
+PLATFORM_ENV = "REMEDDY_PLATFORM"
+REMOTE_TARGET_ENV = "REMEDDY_REMOTE_TARGET"
+CLIXML_CODEPOINT = re.compile(r"_x([0-9A-Fa-f]{4})_")
+REMOTE_EDITOR_TOKENS = ("code", "codium", "cursor")
+
+
+class CliError(RuntimeError):
+    """An expected user-facing failure."""
+
+
+def ps_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def logical_cwd() -> Path:
+    pwd = os.environ.get("PWD")
+    if pwd:
+        candidate = Path(pwd).expanduser()
+        if candidate.is_absolute():
+            try:
+                if candidate.resolve() == Path.cwd().resolve():
+                    return candidate
+            except OSError:
+                pass
+    return Path.cwd()
+
+
+def target_path(path: str | None) -> str:
+    base = logical_cwd()
+    if not path:
+        return str(base)
+
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    return str(candidate)
+
+
+def default_remote_target() -> str:
+    return (
+        os.environ.get(REMOTE_TARGET_ENV)
+        or os.environ.get(LEGACY_REMOTE_TARGET_ENV)
+        or socket.gethostname()
+    )
+
+
+def normalize_platform(value: str) -> str:
+    platform = value.lower()
+    if platform == "auto":
+        return "auto"
+    if platform in {"mac", "macos", "darwin", "osx"}:
+        return "macos"
+    if platform in {"win", "windows"}:
+        return "windows"
+    raise CliError(f"unsupported platform: {value!r}; choose auto, windows, or macos")
+
+
+def window_flag(args: argparse.Namespace) -> str | None:
+    if args.new_window:
+        return "--new-window"
+    if args.reuse_window:
+        return "--reuse-window"
+    return None
+
+
+def supports_remote_ssh_args(app_name: str) -> bool:
+    lower = app_name.lower()
+    return any(token in lower for token in REMOTE_EDITOR_TOKENS)
+
+
+def run_capture(command: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def ssh_base(ssh_options: list[str], host: str) -> list[str]:
+    return ["ssh", *ssh_options, host]
+
+
+def detect_remote_platform(host: str, ssh_options: list[str]) -> str:
+    uname = run_capture([*ssh_base(ssh_options, host), "/usr/bin/uname", "-s"])
+    if uname.returncode == 0 and uname.stdout.strip() == "Darwin":
+        return "macos"
+
+    powershell = run_capture(
+        [
+            *ssh_base(ssh_options, host),
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-OutputFormat",
+            "Text",
+            "-Command",
+            "Write-Output windows",
+        ]
+    )
+    if powershell.returncode == 0 and "windows" in clean_powershell_output(powershell.stdout).lower():
+        return "windows"
+
+    details = []
+    if uname.stderr.strip() or uname.stdout.strip():
+        details.append(clean_powershell_output("\n".join((uname.stdout, uname.stderr))).strip())
+    if powershell.stderr.strip() or powershell.stdout.strip():
+        details.append(clean_powershell_output("\n".join((powershell.stdout, powershell.stderr))).strip())
+    suffix = f": {'; '.join(part for part in details if part)}" if details else ""
+    raise CliError(f"could not detect remote OS for {host!r}{suffix}")
+
+
+def editor_cli_name(app_name: str) -> str:
+    lower = app_name.lower()
+    if "insider" in lower:
+        return "code-insiders"
+    if "codium" in lower:
+        return "codium"
+    return "code"
+
+
+def windows_editor_names(app_name: str) -> tuple[str, str, str]:
+    lower = app_name.lower()
+    cli_name = editor_cli_name(app_name) if supports_remote_ssh_args(app_name) else app_name.removesuffix(".exe")
+    cli_cmd = f"{cli_name}.cmd"
+
+    if app_name.lower().endswith(".exe"):
+        exe_name = app_name
+    elif "insider" in lower:
+        exe_name = "Code - Insiders.exe"
+    elif lower in {"code", "visual studio code"}:
+        exe_name = "Code.exe"
+    else:
+        exe_name = f"{app_name}.exe"
+
+    if "insider" in lower:
+        install_dir = "Microsoft VS Code Insiders"
+    elif lower in {"code", "visual studio code"}:
+        install_dir = "Microsoft VS Code"
+    else:
+        install_dir = app_name.removesuffix(".exe")
+
+    return exe_name, cli_cmd, install_dir
+
+
+def powershell_script(
+    remote_target: str,
+    remote_path: str,
+    selected_window_flag: str | None,
+    app_name: str,
+) -> str:
+    remote_name = f"ssh-remote+{remote_target}"
+    window_arg = f"$arguments += {ps_quote(selected_window_flag)}" if selected_window_flag else ""
+    exe_name, cli_cmd, install_dir = windows_editor_names(app_name)
+    app_label = app_name.removesuffix(".exe")
+    uses_remote_args = supports_remote_ssh_args(app_name)
+    local_app_exe = ps_quote(f"Programs\\{install_dir}\\{exe_name}")
+    local_app_cli = ps_quote(f"Programs\\{install_dir}\\bin\\{cli_cmd}")
+    program_exe = ps_quote(f"{install_dir}\\{exe_name}")
+    program_cli = ps_quote(f"{install_dir}\\bin\\{cli_cmd}")
+    cli_binary = ps_quote(cli_cmd.removesuffix(".cmd"))
+    script = f"""$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$remoteName = {ps_quote(remote_name)}
+$remotePath = {ps_quote(remote_path)}
+$candidates = @()
+
+if ($env:LOCALAPPDATA) {{
+    $candidates += Join-Path $env:LOCALAPPDATA {local_app_exe}
+    $candidates += Join-Path $env:LOCALAPPDATA {local_app_cli}
+}}
+if ($env:ProgramFiles) {{
+    $candidates += Join-Path $env:ProgramFiles {program_exe}
+    $candidates += Join-Path $env:ProgramFiles {program_cli}
+}}
+if (${{env:ProgramFiles(x86)}}) {{
+    $candidates += Join-Path ${{env:ProgramFiles(x86)}} {program_exe}
+    $candidates += Join-Path ${{env:ProgramFiles(x86)}} {program_cli}
+}}
+
+$cmd = Get-Command {ps_quote(exe_name)} -ErrorAction SilentlyContinue
+if ($cmd) {{ $candidates += $cmd.Source }}
+
+$cmd = Get-Command {ps_quote(cli_cmd)} -ErrorAction SilentlyContinue
+if ($cmd) {{ $candidates += $cmd.Source }}
+
+$cmd = Get-Command {cli_binary} -ErrorAction SilentlyContinue
+if ($cmd) {{ $candidates += $cmd.Source }}
+
+$code = $candidates |
+    Where-Object {{ $_ -and (Test-Path -LiteralPath $_) }} |
+    Select-Object -First 1
+
+if (-not $code) {{
+    throw 'Could not find {exe_name} or {cli_cmd} on the Windows host. Install {app_label} or add its bin directory to PATH.'
+}}
+
+function Quote-CommandArgument([string]$value) {{
+    '"' + ($value -replace '"', '\\"') + '"'
+}}
+
+$arguments = @()
+"""
+    if uses_remote_args:
+        argument_block = f"""{window_arg}
+$arguments += '--remote'
+$arguments += $remoteName
+$arguments += $remotePath
+"""
+    else:
+        argument_block = ""
+
+    return script + f"""{argument_block}
+$argumentString = ($arguments | ForEach-Object {{ Quote-CommandArgument $_ }}) -join ' '
+$taskName = 'remeddy-' + [Guid]::NewGuid().ToString('N')
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+try {{
+    $action = New-ScheduledTaskAction -Execute $code -Argument $argumentString
+    $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+    Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+    Start-ScheduledTask -TaskName $taskName
+    Start-Sleep -Seconds 2
+}} finally {{
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+}}
+"""
+
+
+def encoded_powershell(script: str) -> str:
+    return base64.b64encode(script.encode("utf-16le")).decode("ascii")
+
+
+def macos_shell_script(
+    remote_target: str,
+    remote_path: str,
+    selected_window_flag: str | None,
+    app_name: str,
+) -> str:
+    if not supports_remote_ssh_args(app_name):
+        open_name = app_name.removesuffix(".app")
+        return f"exec /usr/bin/open -a {shlex.quote(open_name)}"
+
+    remote_name = f"ssh-remote+{remote_target}"
+    selected_window_flag = selected_window_flag or "--new-window"
+    arguments = [selected_window_flag, "--remote", remote_name, remote_path]
+    quoted_arguments = " ".join(shlex.quote(arg) for arg in arguments)
+    cli_name = editor_cli_name(app_name)
+    app_bundle = app_name if app_name.endswith(".app") else f"{app_name}.app"
+    system_candidate = shlex.quote(f"/Applications/{app_bundle}/Contents/Resources/app/bin/{cli_name}")
+    home_suffix = (
+        f"/Applications/{app_bundle}/Contents/Resources/app/bin/{cli_name}"
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("`", "\\`")
+        .replace("$", "\\$")
+    )
+    home_candidate = f'"$HOME{home_suffix}"'
+    return f"""code=''
+for candidate in {shlex.quote(cli_name)} {system_candidate} {home_candidate}; do
+    if [ "$candidate" = {shlex.quote(cli_name)} ]; then
+        if command -v {shlex.quote(cli_name)} >/dev/null 2>&1; then
+            code="$(command -v {shlex.quote(cli_name)})"
+            break
+        fi
+    elif [ -x "$candidate" ]; then
+        code="$candidate"
+        break
+    fi
+done
+
+if [ -z "$code" ]; then
+    echo "remeddy: could not find {cli_name} on the macOS host; install the shell command or keep {shlex.quote(app_bundle)} in /Applications" >&2
+    exit 127
+fi
+
+nohup "$code" {quoted_arguments} >/dev/null 2>&1 &
+"""
+
+
+def decode_clixml_text(text: str) -> str:
+    def replace_codepoint(match: re.Match[str]) -> str:
+        return chr(int(match.group(1), 16))
+
+    return CLIXML_CODEPOINT.sub(replace_codepoint, text)
+
+
+def clean_powershell_output(text: str) -> str:
+    text = text.strip()
+    if not text.startswith("#< CLIXML"):
+        return text
+
+    xml_start = text.find("<Objs")
+    if xml_start == -1:
+        return decode_clixml_text(text)
+
+    try:
+        root = ET.fromstring(text[xml_start:])
+    except ET.ParseError:
+        return decode_clixml_text(text)
+
+    messages: list[str] = []
+    for element in root.iter():
+        if element.tag.endswith("S") and element.text:
+            messages.append(decode_clixml_text(element.text))
+    return "".join(messages).strip() or decode_clixml_text(text)
+
+
+def build_windows_ssh_command(
+    host: str,
+    ssh_options: list[str],
+    remote_target: str,
+    remote_path: str,
+    selected_window_flag: str | None,
+    app_name: str,
+) -> list[str]:
+    script = powershell_script(remote_target, remote_path, selected_window_flag, app_name)
+    return [
+        *ssh_base(ssh_options, host),
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-OutputFormat",
+        "Text",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        encoded_powershell(script),
+    ]
+
+
+def build_macos_ssh_command(
+    host: str,
+    ssh_options: list[str],
+    remote_target: str,
+    remote_path: str,
+    selected_window_flag: str | None,
+    app_name: str,
+) -> list[str]:
+    script = macos_shell_script(remote_target, remote_path, selected_window_flag, app_name)
+    return [*ssh_base(ssh_options, host), "/bin/sh", "-lc", shlex.quote(script)]
+
+
+def build_ssh_command(args: argparse.Namespace, platform: str) -> list[str]:
+    remote_path = target_path(args.path)
+    selected_window_flag = window_flag(args)
+    if platform == "windows":
+        return build_windows_ssh_command(
+            args.host,
+            args.ssh_option,
+            args.remote_target,
+            remote_path,
+            selected_window_flag,
+            args.app,
+        )
+
+    if platform == "macos":
+        return build_macos_ssh_command(
+            args.host,
+            args.ssh_option,
+            args.remote_target,
+            remote_path,
+            selected_window_flag,
+            args.app,
+        )
+
+    raise CliError(f"unsupported detected platform: {platform}")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Launch a remote desktop editor and open a Remote-SSH window for "
+            "this machine's current directory."
+        )
+    )
+    parser.add_argument("host", help="SSH host for the remote desktop machine.")
+    parser.add_argument(
+        "app",
+        nargs="?",
+        default=os.environ.get(APP_ENV, DEFAULT_APP),
+        help=f"Editor app name. Defaults to ${APP_ENV} or {DEFAULT_APP!r}.",
+    )
+    parser.add_argument(
+        "-p",
+        "--platform",
+        default=os.environ.get(PLATFORM_ENV, "auto"),
+        help=f"Remote desktop platform: auto, windows, or macos. Defaults to ${PLATFORM_ENV} or auto.",
+    )
+    parser.add_argument(
+        "--path",
+        help="Remote path to open on this machine. Defaults to the current directory.",
+    )
+    parser.add_argument(
+        "-t",
+        "--remote-target",
+        default=default_remote_target(),
+        help=(
+            "Remote-SSH target name for this machine as configured in the editor "
+            f"on the remote desktop. Defaults to ${REMOTE_TARGET_ENV}, "
+            f"${LEGACY_REMOTE_TARGET_ENV}, or this hostname."
+        ),
+    )
+    parser.add_argument(
+        "-n",
+        "--new-window",
+        action="store_true",
+        help="Ask the editor to open a new window.",
+    )
+    parser.add_argument(
+        "-r",
+        "--reuse-window",
+        action="store_true",
+        help="Ask the editor to reuse an existing window.",
+    )
+    parser.add_argument(
+        "-o",
+        "--ssh-option",
+        action="append",
+        default=[],
+        metavar="OPTION",
+        help="Additional option passed to ssh before the host. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the launch ssh command without running it. Auto mode still probes the host.",
+    )
+    args = parser.parse_args(argv)
+    args.platform = normalize_platform(args.platform)
+    if args.new_window and args.reuse_window:
+        raise CliError("choose only one of --new-window or --reuse-window")
+    return args
+
+
+def main(argv: list[str]) -> int:
+    try:
+        args = parse_args(argv)
+        platform = (
+            detect_remote_platform(args.host, args.ssh_option)
+            if args.platform == "auto"
+            else args.platform
+        )
+        command = build_ssh_command(args, platform)
+        if args.dry_run:
+            print(" ".join(command))
+            return 0
+        completed = run_capture(command)
+        if completed.returncode != 0:
+            output = clean_powershell_output("\n".join((completed.stdout, completed.stderr)))
+            if output:
+                print(output, file=sys.stderr)
+            return completed.returncode
+    except CliError as exc:
+        print(f"remeddy: {exc}", file=sys.stderr)
+        return 2
+    except FileNotFoundError:
+        print("remeddy: ssh was not found on PATH", file=sys.stderr)
+        return 127
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

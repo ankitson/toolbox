@@ -35,6 +35,6 @@ list: skills-list
 test-resume-session:
   python -B -m unittest discover -s bin/tests -v
 
-# Run the focused regression test for launching Windows Code Insiders.
-test-wined:
-  python -B -m unittest discover -s bin/tests -p 'test_wined.py' -v
+# Run the focused regression test for the remote editor launcher.
+test-remeddy:
+  python -B -m unittest discover -s bin/tests -p 'test_remeddy.py' -v

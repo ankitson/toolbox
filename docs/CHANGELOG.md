@@ -1,5 +1,19 @@
 # Toolbox Changelog
 
+## 2026-06-11
+
+### Remeddy remote editor launcher
+- Renamed the utility to `bin/remeddy`.
+- Changed the CLI to `remeddy <host> [app]`, defaulting the app to
+  `Visual Studio Code - Insiders`.
+- Added remote OS auto-detection over SSH, probing macOS with `uname` and
+  Windows with `powershell.exe`.
+- Split app handling between Remote-SSH editors and generic GUI apps, so
+  commands like `remeddy m2book Spotify` launch the app without VS Code flags.
+- Changed macOS launch behavior to use the `code-insiders` CLI and default to a
+  new window, avoiding `open -a` activating an unrelated existing workspace.
+- Added Windows, macOS, app override, and platform override regression coverage.
+
 ## 2026-06-10
 
 ### Wined launcher
