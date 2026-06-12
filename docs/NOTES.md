@@ -203,3 +203,26 @@
 - Added each Cloudflare skill through `bin/skillctl add` so `skills.toml` can
   refresh them later.
 - Ran `bin/skillctl check`: 18 external skills, 14 custom skills.
+
+## 2026-06-11 — Docme Markdown site helper
+
+### Goal
+- Add a standalone toolbox command for turning a directory of Markdown files into a quick MkDocs Material site.
+
+### Decisions
+- Name the tool `docme`.
+- Keep the tool self-contained: it builds and serves docs, but does not publish to webby.
+- Use PEP 723 metadata with `uv run --script` and depend on `mkdocs-material` directly.
+- If `mkdocs.yml` or `mkdocs.yaml` exists in the root directory, delegate to it and only override the build output directory.
+- Scan all `.md` files recursively from the current directory, capped at depth 3 by default and configurable with `--depth`.
+- Stage discovered Markdown files into a temporary MkDocs docs tree, preserving relative paths, so the output directory can safely be anywhere, including `./site`.
+- For generated fallback config, use `pymdownx.slugs.slugify` so anchors such as `#ask--semantic-search` match docs that expect GitHub-compatible punctuation handling.
+- Suppress Material for MkDocs' MkDocs 2.0 banner via its `NO_MKDOCS_2_WARNING` environment flag inside `docme` subprocesses.
+
+### Verification
+- Built a scratch Markdown tree with default depth and confirmed a depth-4 file was excluded.
+- Rebuilt with `--depth 4` and confirmed the deeper file was included.
+- Verified global dotfiles `just docs-deploy` can use `docme build --output <tmp>` and publish that output separately via webby.
+- Built `/projects/job-search` and confirmed `docme` uses its `mkdocs.yml`; the previous anchor warnings disappear.
+- Built a fallback scratch doc with `Ask — semantic search` and confirmed `#ask--semantic-search` resolves.
+- Verified configured and fallback builds no longer print the Material MkDocs 2.0 banner.

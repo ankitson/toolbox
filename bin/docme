@@ -1,0 +1,292 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "mkdocs-material",
+# ]
+# ///
+"""Build or serve a quick MkDocs site from Markdown files."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+DEFAULT_DEPTH = 3
+IGNORED_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "site",
+    "venv",
+}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="docme",
+        description="Build or serve Markdown files as a temporary MkDocs Material site.",
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path.cwd(),
+        help="directory to scan for Markdown files (default: current directory)",
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=DEFAULT_DEPTH,
+        help=f"maximum directory depth to scan below root (default: {DEFAULT_DEPTH})",
+    )
+    parser.add_argument(
+        "--site-name",
+        help="site title for generated MkDocs config (default: title-cased root name)",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    build_parser = subparsers.add_parser("build", help="build a static site")
+    build_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=Path("site"),
+        help="output directory for the built site (default: ./site)",
+    )
+
+    serve_parser = subparsers.add_parser("serve", help="serve the generated site locally")
+    serve_parser.add_argument(
+        "-a",
+        "--dev-addr",
+        default="127.0.0.1:8000",
+        help="MkDocs dev server address (default: 127.0.0.1:8000)",
+    )
+    serve_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="site output directory for MkDocs serve (default: temporary directory)",
+    )
+
+    args = parser.parse_args()
+    root = args.root.resolve()
+    if args.depth < 0:
+        parser.error("--depth must be >= 0")
+    if not root.is_dir():
+        parser.error(f"--root is not a directory: {root}")
+
+    config = existing_config(root)
+    site_name = args.site_name or title_from_dir(root)
+    if args.command == "build":
+        return build(root, config, args.depth, args.output, site_name)
+    if args.command == "serve":
+        return serve(root, config, args.depth, args.output, args.dev_addr, site_name)
+
+    parser.error(f"unknown command: {args.command}")
+    return 2
+
+
+def build(
+    root: Path,
+    config: Path | None,
+    depth: int,
+    output: Path,
+    site_name: str,
+) -> int:
+    output_dir = output if output.is_absolute() else root / output
+    if config is not None:
+        return run(
+            mkdocs(
+                "build",
+                "--strict",
+                "--config-file",
+                str(config),
+                "--site-dir",
+                str(output_dir),
+            ),
+            root,
+        )
+
+    markdown_files = discover_markdown_or_exit(root, depth)
+    with tempfile.TemporaryDirectory(prefix="docme-") as temp:
+        temp_path = Path(temp)
+        docs_dir = temp_path / "docs"
+        stage_markdown(root, markdown_files, docs_dir)
+        config_path = write_config(temp_path, docs_dir, output_dir, site_name)
+        return run(mkdocs("build", "--strict", "--config-file", str(config_path)), root)
+
+
+def serve(
+    root: Path,
+    config: Path | None,
+    depth: int,
+    output: Path | None,
+    dev_addr: str,
+    site_name: str,
+) -> int:
+    if config is not None:
+        if output is not None:
+            print(
+                "docme: ignoring --output for an existing mkdocs.yml; mkdocs serve has no --site-dir flag",
+                file=sys.stderr,
+            )
+        return run(mkdocs("serve", "--dev-addr", dev_addr, "--config-file", str(config)), root)
+
+    markdown_files = discover_markdown_or_exit(root, depth)
+    with tempfile.TemporaryDirectory(prefix="docme-") as temp:
+        temp_path = Path(temp)
+        docs_dir = temp_path / "docs"
+        site_dir = output if output is not None else temp_path / "site"
+        if not site_dir.is_absolute():
+            site_dir = root / site_dir
+        stage_markdown(root, markdown_files, docs_dir)
+        config_path = write_config(temp_path, docs_dir, site_dir, site_name)
+        return run(
+            mkdocs(
+                "serve",
+                "--dev-addr",
+                dev_addr,
+                "--config-file",
+                str(config_path),
+                "--watch",
+                str(root),
+            ),
+            root,
+        )
+
+
+def existing_config(root: Path) -> Path | None:
+    for name in ("mkdocs.yml", "mkdocs.yaml"):
+        path = root / name
+        if path.exists():
+            return path
+    return None
+
+
+def discover_markdown_or_exit(root: Path, depth: int) -> list[Path]:
+    markdown_files = discover_markdown(root, depth)
+    if markdown_files:
+        return markdown_files
+    raise SystemExit(f"no markdown files found under {root} within depth {depth}")
+
+
+def discover_markdown(root: Path, max_depth: int) -> list[Path]:
+    files: list[Path] = []
+    for current, dirnames, filenames in os.walk(root):
+        current_path = Path(current)
+        relative_dir = current_path.relative_to(root)
+        dir_depth = 0 if relative_dir == Path(".") else len(relative_dir.parts)
+
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if dir_depth < max_depth and name not in IGNORED_DIRS and not name.startswith(".")
+        ]
+
+        for filename in filenames:
+            if filename.lower().endswith(".md"):
+                files.append(current_path / filename)
+    return sorted(files, key=lambda path: path.relative_to(root).as_posix().lower())
+
+
+def stage_markdown(root: Path, markdown_files: list[Path], docs_dir: Path) -> None:
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    has_root_index = False
+    staged_rel_paths: list[Path] = []
+
+    for source in markdown_files:
+        relative = source.relative_to(root)
+        if len(relative.parts) == 1 and relative.name.lower() in {"index.md", "readme.md"}:
+            has_root_index = True
+        target = docs_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.symlink_to(source)
+        except OSError:
+            shutil.copy2(source, target)
+        staged_rel_paths.append(relative)
+
+    if not has_root_index:
+        write_index(docs_dir / "index.md", staged_rel_paths)
+
+
+def write_index(path: Path, markdown_files: list[Path]) -> None:
+    links = []
+    for relative in markdown_files:
+        href = relative.as_posix()
+        label = title_from_path(relative)
+        links.append(f"- [{label}]({href})")
+
+    body = "# Docs\n\n" + "\n".join(links) + "\n"
+    path.write_text(body, encoding="utf-8")
+
+
+def write_config(temp_path: Path, docs_dir: Path, site_dir: Path, site_name: str) -> Path:
+    config_path = temp_path / "mkdocs.yml"
+    config = f"""site_name: {json.dumps(site_name)}
+docs_dir: {json.dumps(str(docs_dir))}
+site_dir: {json.dumps(str(site_dir))}
+theme:
+  name: material
+markdown_extensions:
+  - admonition
+  - tables
+  - attr_list
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - toc:
+      permalink: true
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds: {{case: lower, percent_encode: false}}
+"""
+    config_path.write_text(config, encoding="utf-8")
+    return config_path
+
+
+def mkdocs(*args: str) -> list[str]:
+    return [sys.executable, "-m", "mkdocs", *args]
+
+
+def run(args: list[str], cwd: Path) -> int:
+    print(shlex_join(args), flush=True)
+    env = os.environ.copy()
+    env.setdefault("NO_MKDOCS_2_WARNING", "true")
+    return subprocess.run(args, cwd=cwd, env=env).returncode
+
+
+def title_from_dir(path: Path) -> str:
+    return title_from_text(path.name) or "Docs"
+
+
+def title_from_path(path: Path) -> str:
+    stem = path.with_suffix("").as_posix()
+    return title_from_text(stem) or stem
+
+
+def title_from_text(text: str) -> str:
+    words = re.split(r"[^A-Za-z0-9]+", text)
+    return " ".join(word.capitalize() for word in words if word)
+
+
+def shlex_join(args: list[str]) -> str:
+    import shlex
+
+    return shlex.join(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)

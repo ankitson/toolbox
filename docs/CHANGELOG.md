@@ -100,3 +100,13 @@
   `workers-best-practices` in `skills.toml`.
 - Copied the skill folders into `skills/` so the existing Codex skills symlink
   can discover them.
+
+## 2026-06-11
+
+### Docme
+- Added `bin/docme`, a PEP 723 `uv run --script` tool for building or serving a quick MkDocs Material site from Markdown files.
+- `docme` scans all `.md` files under the current directory up to depth 3 by default; `--depth` and `--root` make the scan configurable.
+- `docme build --output DIR` writes the built site to a configurable output directory and does not know about webby or deployment.
+- `docme` uses an existing `mkdocs.yml`/`mkdocs.yaml` in the root directory before falling back to generated Markdown staging.
+- Generated fallback config uses the `pymdownx.slugs.slugify` GitHub-compatible slugifier so hand-written anchors with punctuation resolve.
+- `docme` sets `NO_MKDOCS_2_WARNING=true` for MkDocs subprocesses to suppress Material's MkDocs 2.0 banner while preserving normal build output.
