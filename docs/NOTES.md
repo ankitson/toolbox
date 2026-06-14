@@ -218,6 +218,11 @@
 - Stage discovered Markdown files into a temporary MkDocs docs tree, preserving relative paths, so the output directory can safely be anywhere, including `./site`.
 - For generated fallback config, use `pymdownx.slugs.slugify` so anchors such as `#ask--semantic-search` match docs that expect GitHub-compatible punctuation handling.
 - Suppress Material for MkDocs' MkDocs 2.0 banner via its `NO_MKDOCS_2_WARNING` environment flag inside `docme` subprocesses.
+- Include linked local files in fallback mode so images and other assets referenced by Markdown are present in the built site.
+- Do not stage files outside the selected root. Rewrite those links to `file://` URLs and report them as skipped to avoid quietly publishing unrelated local files.
+- Avoid strict MkDocs builds for ad hoc docs; report skipped links separately instead of aborting on warnings.
+- Cap linked non-Markdown files at 25 MiB by default, configurable with `--max-linked-file-size-mib`.
+- Use the same default visual baseline as the job-search docs for generated fallback sites: Material theme, slate palette, IBM Plex Sans text, and IBM Plex Mono code.
 
 ### Verification
 - Built a scratch Markdown tree with default depth and confirmed a depth-4 file was excluded.
@@ -226,3 +231,27 @@
 - Built `/projects/job-search` and confirmed `docme` uses its `mkdocs.yml`; the previous anchor warnings disappear.
 - Built a fallback scratch doc with `Ask — semantic search` and confirmed `#ask--semantic-search` resolves.
 - Verified configured and fallback builds no longer print the Material MkDocs 2.0 banner.
+- Built `/projects/toolbox` in fallback mode and confirmed linked media/static files are included while outside-root links are reported without aborting.
+
+## 2026-06-12 — Docme generated docs listing
+
+### Discovery
+- Toolbox's root `AGENTS.md` was included in the fallback build as `/AGENTS/`, but projects with a root `README.md` skipped the generated all-docs index because the README became the homepage.
+
+### Decision
+- Keep an existing root `README.md` or `index.md` as the homepage.
+- Add a separate generated `Docs` listing page for fallback builds with a homepage, using `docs.md` unless that name is already taken.
+
+### Verification
+- Built `/projects/toolbox` in fallback mode and confirmed the generated `/docs/` page links to `/AGENTS/`.
+
+## 2026-06-13 — WezTerm bug investigations (moved to the wezterm repo)
+
+The detailed root-cause / reproduction / fix-verification / deployment notes for the
+WezTerm bugs worked on this day — PaneFocused notification storm (#4390 / PR #7763),
+`adjust_x_size`/`adjust_y_size` resize dead loop (#7765), and mux resize-sync
+(attach undersize #5117, drag desync #5142/#3694) — were relocated to the wezterm
+fork at `/projects/external-repo/wezterm/investigations/` (fixes on the `fix/*`
+branches of `github.com/ankitson/wezterm`). All three fixes are deployed locally
+(Mac `wezterm-gui` bundle + Linux `wezterm-mux-server`); durability needs a one-time
+`sudo cp ~/wezterm-patched-bin/* /usr/bin/` (now done).
