@@ -1,5 +1,24 @@
 # Toolbox Changelog
 
+## 2026-06-15
+
+### Serializd review fixes
+- Fixed `review-add` failing with `500 Internal Server Error`: Serializd's
+  `reviews/add` endpoint requires both `backdate` and `rating`, but the payload
+  builder stripped any field that was unset. `backdate` is now always sent,
+  defaulting to the current time (bare dates like `2024-01-15` are expanded to a
+  full ISO 8601 datetime).
+- Made `--rating` required for `review-add` and stopped silently sending a `0`;
+  an explicit `--rating 0` is still accepted and recorded as "unrated".
+- Forced every review the CLI writes to be logged (`is_log` is no longer
+  user-toggleable). Unlogged reviews never appear in the diary or logged-episode
+  lists, so they can't be found, updated, or deleted from any Serializd surface —
+  the CLI no longer creates that orphaned state. Removed the `--log`/`--no-log`
+  flags accordingly.
+- Improved HTTP error reporting across all requests: errors now include the
+  method, URL, status, reason, and server response body, and flag `5xx` as a
+  server-side failure and `429` as rate limiting.
+
 ## 2026-06-11
 
 ### Remeddy remote editor launcher

@@ -5,6 +5,7 @@
 # ///
 import json, os, sys, argparse, textwrap, re
 from pathlib import Path
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 
 import requests
@@ -23,13 +24,58 @@ def _rating_to_api(rating):
 
 
 def _rating_from_api(rating):
-    if rating in (None, ""):
+    # 0 is Serializd's sentinel for "unrated", not a real half-star score.
+    if rating in (None, "", 0):
         return None
     return float(rating) / 2
 
 
 def _format_rating(rating):
     return f"{rating:.1f}".rstrip("0").rstrip(".")
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _normalize_backdate(backdate):
+    """Serializd requires a full ISO 8601 datetime. Default to now; expand bare dates."""
+    if not backdate:
+        return _now_iso()
+    backdate = str(backdate).strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", backdate):
+        return f"{backdate}T00:00:00Z"
+    return backdate
+
+
+def _response_detail(resp):
+    """Best-effort human-readable detail from a response body."""
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            return body.get("message") or body.get("error") or json.dumps(body)
+        return json.dumps(body)
+    except Exception:
+        return (resp.text or "").strip()
+
+
+def _http_error_message(resp, context=""):
+    """Build a detailed, multi-line error message for a failed HTTP response."""
+    req = getattr(resp, "request", None)
+    method = req.method if req else "?"
+    url = req.url if req else resp.url
+    detail = _response_detail(resp)[:500]
+    lines = [f"Error: {method} {url} -> HTTP {resp.status_code} {resp.reason}".rstrip()]
+    if detail and detail.lower() != (resp.reason or "").lower():
+        lines.append(f"  Server response: {detail}")
+    if resp.status_code >= 500:
+        lines.append("  This is a server-side error (5xx): the request reached Serializd "
+                     "but it failed while processing it.")
+    elif resp.status_code == 429:
+        lines.append("  Rate limited (429). Wait a bit and try again.")
+    if context:
+        lines.append(f"  While: {context}")
+    return "\n".join(lines)
 
 
 class SerializdCLI:
@@ -82,11 +128,7 @@ class SerializdCLI:
             print("Session expired. Run: serializd login", file=sys.stderr)
             sys.exit(1)
         if resp.status_code >= 400:
-            try:
-                err = resp.json()
-                print(f"Error: {err.get('message', resp.text)}", file=sys.stderr)
-            except Exception:
-                print(f"Error ({resp.status_code}): {resp.text[:200]}", file=sys.stderr)
+            print(_http_error_message(resp), file=sys.stderr)
             sys.exit(1)
         return resp.json()
 
@@ -95,11 +137,7 @@ class SerializdCLI:
         headers.update(self._auth_headers())
         resp = self.scraper.request(method, f"{API_BASE}{path}", headers=headers, **kwargs)
         if resp.status_code >= 400:
-            try:
-                err = resp.json()
-                print(f"Error: {err.get('message', resp.text)}", file=sys.stderr)
-            except Exception:
-                print(f"Error ({resp.status_code}): {resp.text[:200]}", file=sys.stderr)
+            print(_http_error_message(resp), file=sys.stderr)
             sys.exit(1)
         return resp.json()
 
@@ -220,11 +258,7 @@ class SerializdCLI:
     def login(self, email, password):
         resp = self.scraper.post(f"{API_BASE}/api/login", json={"email": email, "password": password})
         if resp.status_code >= 400:
-            try:
-                err = resp.json()
-                print(f"Login failed: {err.get('message', resp.text)}", file=sys.stderr)
-            except Exception:
-                print(f"Login failed ({resp.status_code})", file=sys.stderr)
+            print(_http_error_message(resp, context="login"), file=sys.stderr)
             sys.exit(1)
         data = resp.json()
         self._save_token(data["token"], data["username"])
@@ -446,9 +480,16 @@ class SerializdCLI:
 
     def review_add(self, show_input, review_text=None, rating=None, season_input=None,
                    episode_number=None, contains_spoiler=False, backdate=None,
-                   is_log=False, is_rewatch=False, tags=None, allows_comments=True,
+                   is_rewatch=False, tags=None, allows_comments=True,
                    like=False, force=False):
         self._ensure_auth()
+        # A rating is mandatory: Serializd's add endpoint requires one, and we won't
+        # silently invent it. The user must pass --rating, but may pass 0 to mean
+        # "unrated". Fail fast before any network calls.
+        if _rating_to_api(rating) is None:
+            print("Error: a rating is required to add a review. "
+                  "Pass --rating (0 for unrated, or 0.5-5.0 in 0.5 steps).", file=sys.stderr)
+            sys.exit(1)
         show_id = self.resolve_show_id(str(show_input))
         show_data = self._public_request("GET", f"/api/show/{show_id}")
 
@@ -488,34 +529,41 @@ class SerializdCLI:
             rid = found.get("id") or found.get("reviewId")
             return self.review_update(rid, review_text=review_text, rating=rating,
                                        contains_spoiler=contains_spoiler,
-                                       backdate=backdate, is_log=is_log,
+                                       backdate=backdate, is_log=True,
                                        is_rewatch=is_rewatch, episode_number=episode_number,
                                        tags=tags, allows_comments=allows_comments, like=like)
 
+        # Serializd's reviews/add endpoint 500s unless both `rating` and `backdate`
+        # are present (rating validated up front). backdate defaults to now,
+        # mirroring the web app. season_id/episode_number may stay null.
+        #
+        # is_log is forced True: an unlogged review never appears in the diary or
+        # logged-episodes lists, so it can't be found, updated, or deleted from any
+        # Serializd surface (web UI included) — a dead, unmanageable record. Every
+        # real review on the account is logged; we refuse to create the broken state.
         payload = {
             "show_id": show_id,
             "season_id": season_id,
+            "episode_number": episode_number,
             "review_text": review_text or "",
             "rating": _rating_to_api(rating),
             "contains_spoiler": contains_spoiler,
-            "backdate": backdate,
-            "is_log": is_log,
+            "backdate": _normalize_backdate(backdate),
+            "is_log": True,
             "is_rewatch": is_rewatch,
-            "episode_number": episode_number,
             "tags": tags or [],
             "allows_comments": allows_comments,
             "like": like,
         }
-        payload = {k: v for k, v in payload.items() if v is not None}
         self._add_review_payload(payload)
         parts = [show_data["name"]]
         if episode_number is not None and season_input:
             parts.append(f"S{season_input}E{episode_number}")
         elif season_input:
             parts.append(f"season {season_input}")
-        flags = []
-        if is_log: flags.append("logged")
-        if rating is not None: flags.append(f"rated {_format_rating(rating)}/5")
+        flags = ["logged"]
+        if rating == 0: flags.append("unrated")
+        elif rating is not None: flags.append(f"rated {_format_rating(rating)}/5")
         flag_str = f" ({', '.join(flags)})" if flags else ""
         print(f"Review added for {' '.join(parts)}{flag_str}")
 
@@ -532,10 +580,10 @@ class SerializdCLI:
             "show_id": existing.get("showId"),
             "season_id": existing.get("seasonId"),
             "review_text": existing.get("reviewText") or "",
-            "rating": existing.get("rating"),
+            "rating": existing.get("rating") or 0,
             "contains_spoiler": existing.get("containsSpoiler", False),
-            "backdate": existing.get("backdate"),
-            "is_log": existing.get("isLog", False),
+            "backdate": _normalize_backdate(existing.get("backdate")),
+            "is_log": existing.get("isLog", True),
             "is_rewatch": existing.get("isRewatch", False),
             "episode_number": existing.get("episodeNumber"),
             "tags": existing.get("tags") or [],
@@ -543,6 +591,9 @@ class SerializdCLI:
             "like": existing.get("like", True),
         }
         payload.update({k: v for k, v in updates.items() if v is not None})
+        # Never re-create as unlogged: this path deletes then re-adds, and an unlogged
+        # review would become an unmanageable orphan (see review_add).
+        payload["is_log"] = True
         self._request("POST", "/api/show/reviews/delete", json={"review_id": review_id})
         self._add_review_payload(payload)
 
@@ -554,9 +605,10 @@ class SerializdCLI:
         self._ensure_auth()
         payload = {"review_id": review_id}
         api_rating = _rating_to_api(rating)
+        norm_backdate = _normalize_backdate(backdate) if backdate is not None else None
         updates = {}
         for k, v in [("review_text", review_text), ("rating", api_rating),
-                     ("contains_spoiler", contains_spoiler), ("backdate", backdate),
+                     ("contains_spoiler", contains_spoiler), ("backdate", norm_backdate),
                      ("is_log", is_log), ("is_rewatch", is_rewatch),
                      ("episode_number", episode_number), ("tags", tags),
                      ("allows_comments", allows_comments), ("like", like)]:
@@ -565,15 +617,16 @@ class SerializdCLI:
                 updates[k] = v
         resp = self._request_response("POST", "/api/show/reviews/update", json=payload)
         if resp.status_code >= 500:
+            # Serializd's update endpoint is currently broken (always 5xx); fall back
+            # to deleting and re-creating the review with the merged fields.
             self._replace_review(review_id, updates)
             print(f"Review {review_id} replaced after update endpoint failed.")
             return
+        if resp.status_code == 401:
+            print("Session expired. Run: serializd login", file=sys.stderr)
+            sys.exit(1)
         if resp.status_code >= 400:
-            try:
-                err = resp.json()
-                print(f"Error: {err.get('message', resp.text)}", file=sys.stderr)
-            except Exception:
-                print(f"Error ({resp.status_code}): {resp.text[:200]}", file=sys.stderr)
+            print(_http_error_message(resp, context=f"updating review {review_id}"), file=sys.stderr)
             sys.exit(1)
         print(f"Review {review_id} updated.")
 
@@ -598,8 +651,8 @@ class SerializdCLI:
 
 def _ranged_rating(v):
     v = float(v)
-    if v < 0.5 or v > 5.0:
-        raise argparse.ArgumentTypeError("rating must be between 0.5 and 5.0")
+    if v != 0 and (v < 0.5 or v > 5.0):
+        raise argparse.ArgumentTypeError("rating must be 0 (unrated) or between 0.5 and 5.0")
     return int(v * 2 + 0.5) / 2
 
 
@@ -640,36 +693,33 @@ def main():
     p_log_show.add_argument("show", help="TMDB show ID or name")
 
     # review-add
-    p_ra = sub.add_parser("review-add", help="Write a review (with optional log)")
+    p_ra = sub.add_parser("review-add", help="Write a review (always logged to your diary)")
     p_ra.add_argument("show", help="TMDB show ID or name")
     p_ra.add_argument("--season", default=None, help="Season: number, S4, or name (for episode/season reviews)")
     p_ra.add_argument("--episode", type=int, default=None, help="Episode number (for episode reviews)")
-    p_ra.add_argument("--rating", type=_ranged_rating, default=None, help="Rating 0.5-5.0 (0.5 steps)")
+    p_ra.add_argument("--rating", type=_ranged_rating, default=None, required=True, help="Rating: 0 (unrated) or 0.5-5.0 in 0.5 steps (required)")
     p_ra.add_argument("--text", default=None, help="Review text")
     p_ra.add_argument("--spoiler", action="store_true", help="Mark as containing spoilers")
-    p_ra.add_argument("--backdate", default=None, help="Backdate (ISO date, e.g. 2024-01-15)")
-    p_ra.add_argument("--log", action="store_true", help="Also add to diary (log the episode/show)")
+    p_ra.add_argument("--backdate", default=None, help="Backdate (ISO date, e.g. 2024-01-15; defaults to now)")
     p_ra.add_argument("--rewatch", action="store_true", help="Mark as a rewatch")
     p_ra.add_argument("--tags", nargs="*", default=[], help="Tags")
     p_ra.add_argument("--no-comments", action="store_true", help="Disable comments on review")
-    p_ra.add_argument("--no-like", action="store_true", help="Don't auto-like your review")
+    p_ra.add_argument("--like", action="store_false", help="Also like the episode/show")
     p_ra.add_argument("--force", action="store_true", help="Overwrite existing review without prompt")
 
     # review-update
     p_ru = sub.add_parser("review-update", help="Update an existing review")
     p_ru.add_argument("review_id", help="Review ID to update")
-    p_ru.add_argument("--rating", type=_ranged_rating, default=None, help="Rating 0.5-5.0")
+    p_ru.add_argument("--rating", type=_ranged_rating, default=None, help="Rating: 0 (unrated) or 0.5-5.0 in 0.5 steps")
     p_ru.add_argument("--text", default=None, help="Review text")
     p_ru.add_argument("--spoiler", action="store_true", default=None, help="Mark as spoiler")
     p_ru.add_argument("--no-spoiler", action="store_true", default=None, help="Unmark spoiler")
     p_ru.add_argument("--backdate", default=None, help="Backdate (ISO date)")
-    p_ru.add_argument("--log", action="store_true", default=None, help="Add/keep as log")
-    p_ru.add_argument("--no-log", action="store_true", default=None, help="Remove from log")
     p_ru.add_argument("--rewatch", action="store_true", default=None, help="Mark rewatch")
     p_ru.add_argument("--no-rewatch", action="store_true", default=None, help="Unmark rewatch")
     p_ru.add_argument("--tags", nargs="*", default=None, help="Tags")
     p_ru.add_argument("--no-comments", action="store_true", default=None, help="Disable comments")
-    p_ru.add_argument("--no-like", action="store_true", default=None, help="Don't auto-like")
+    p_ru.add_argument("--like", action="store_false", help="Also like the episode/show")
 
     # review-delete
     p_rd = sub.add_parser("review-delete", help="Delete a review")
@@ -718,20 +768,16 @@ def main():
             episode_number=args.episode,
             contains_spoiler=args.spoiler,
             backdate=args.backdate,
-            is_log=args.log,
             is_rewatch=args.rewatch,
             tags=args.tags,
             allows_comments=not args.no_comments,
-            like=not args.no_like,
+            like=args.like,
             force=args.force,
         )
     elif args.command == "review-update":
         spoiler = None
         if args.spoiler: spoiler = True
         if args.no_spoiler: spoiler = False
-        log_val = None
-        if args.log: log_val = True
-        if args.no_log: log_val = False
         rewatch = None
         if args.rewatch: rewatch = True
         if args.no_rewatch: rewatch = False
@@ -741,11 +787,11 @@ def main():
             rating=args.rating,
             contains_spoiler=spoiler,
             backdate=args.backdate,
-            is_log=log_val,
+            is_log=None,
             is_rewatch=rewatch,
             tags=args.tags,
             allows_comments=None if args.no_comments is None else not args.no_comments,
-            like=None if args.no_like is None else not args.no_like,
+            like=args.like,
         )
     elif args.command == "review-delete":
         cli.review_delete(args.review_id)
