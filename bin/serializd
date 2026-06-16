@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
 # dependencies = ["requests"]
@@ -14,6 +14,22 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / 
 CONFIG_FILE = CONFIG_DIR / "auth.json"
 
 FUZZY_THRESHOLD = 0.6
+
+
+def _rating_to_api(rating):
+    if rating is None:
+        return None
+    return int(float(rating) * 2 + 0.5)
+
+
+def _rating_from_api(rating):
+    if rating in (None, ""):
+        return None
+    return float(rating) / 2
+
+
+def _format_rating(rating):
+    return f"{rating:.1f}".rstrip("0").rstrip(".")
 
 
 class SerializdCLI:
@@ -86,6 +102,12 @@ class SerializdCLI:
                 print(f"Error ({resp.status_code}): {resp.text[:200]}", file=sys.stderr)
             sys.exit(1)
         return resp.json()
+
+    def _request_response(self, method, path, **kwargs):
+        self._ensure_auth()
+        headers = kwargs.pop("headers", {})
+        headers.update(self._auth_headers())
+        return self.scraper.request(method, f"{API_BASE}{path}", headers=headers, **kwargs)
 
     # ----- Resolvers -----
 
@@ -333,16 +355,13 @@ class SerializdCLI:
     def _print_review(self, r, label="Review"):
         rating = r.get("rating") or r.get("Rating")
         stars_str = ""
-        if rating:
-            val = float(rating)
-            if val > 5:
-                val = val / 2
-            stars = int(round(val * 2))
+        display = _rating_from_api(rating)
+        if display is not None:
+            stars = int(round(display * 2))
             stars_str = " " + "*" * stars + "◦" * (10 - stars)
         print(f"\n{label}:")
-        if rating:
-            display = float(rating) / 2 if float(rating) > 5 else float(rating)
-            print(f"  Rating: {display}/5{stars_str}")
+        if display is not None:
+            print(f"  Rating: {_format_rating(display)}/5{stars_str}")
         text = self._camel_or_snake(r, "review_text")
         if text:
             print(f"  Text: {text}")
@@ -455,16 +474,17 @@ class SerializdCLI:
                     found = ep["episodeReviews"][0]
                     break
 
-        if found and not force:
-            print("A review already exists for this content:")
-            self._print_review(found)
-            try:
-                ans = input("\nOverwrite it? [y/N] ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                ans = "n"
-            if ans != "y":
-                print("Cancelled.")
-                return
+        if found:
+            if not force:
+                print("A review already exists for this content:")
+                self._print_review(found)
+                try:
+                    ans = input("\nOverwrite it? [y/N] ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    ans = "n"
+                if ans != "y":
+                    print("Cancelled.")
+                    return
             rid = found.get("id") or found.get("reviewId")
             return self.review_update(rid, review_text=review_text, rating=rating,
                                        contains_spoiler=contains_spoiler,
@@ -476,7 +496,7 @@ class SerializdCLI:
             "show_id": show_id,
             "season_id": season_id,
             "review_text": review_text or "",
-            "rating": rating,
+            "rating": _rating_to_api(rating),
             "contains_spoiler": contains_spoiler,
             "backdate": backdate,
             "is_log": is_log,
@@ -487,7 +507,7 @@ class SerializdCLI:
             "like": like,
         }
         payload = {k: v for k, v in payload.items() if v is not None}
-        self._request("POST", "/api/show/reviews/add", json=payload)
+        self._add_review_payload(payload)
         parts = [show_data["name"]]
         if episode_number is not None and season_input:
             parts.append(f"S{season_input}E{episode_number}")
@@ -495,10 +515,36 @@ class SerializdCLI:
             parts.append(f"season {season_input}")
         flags = []
         if is_log: flags.append("logged")
-        if rating: flags.append(f"rated {rating}")
+        if rating is not None: flags.append(f"rated {_format_rating(rating)}/5")
         flag_str = f" ({', '.join(flags)})" if flags else ""
         print(f"Review added for {' '.join(parts)}{flag_str}")
 
+
+    def _add_review_payload(self, payload):
+        self._request("POST", "/api/show/reviews/add", json=payload)
+
+    def _get_review(self, review_id):
+        return self._request("GET", f"/api/review/{review_id}")
+
+    def _replace_review(self, review_id, updates):
+        existing = self._get_review(review_id)
+        payload = {
+            "show_id": existing.get("showId"),
+            "season_id": existing.get("seasonId"),
+            "review_text": existing.get("reviewText") or "",
+            "rating": existing.get("rating"),
+            "contains_spoiler": existing.get("containsSpoiler", False),
+            "backdate": existing.get("backdate"),
+            "is_log": existing.get("isLog", False),
+            "is_rewatch": existing.get("isRewatch", False),
+            "episode_number": existing.get("episodeNumber"),
+            "tags": existing.get("tags") or [],
+            "allows_comments": existing.get("allowsComments", True),
+            "like": existing.get("like", True),
+        }
+        payload.update({k: v for k, v in updates.items() if v is not None})
+        self._request("POST", "/api/show/reviews/delete", json={"review_id": review_id})
+        self._add_review_payload(payload)
 
 
     def review_update(self, review_id, review_text=None, rating=None,
@@ -507,14 +553,28 @@ class SerializdCLI:
                       allows_comments=None, like=None):
         self._ensure_auth()
         payload = {"review_id": review_id}
-        for k, v in [("review_text", review_text), ("rating", rating),
+        api_rating = _rating_to_api(rating)
+        updates = {}
+        for k, v in [("review_text", review_text), ("rating", api_rating),
                      ("contains_spoiler", contains_spoiler), ("backdate", backdate),
                      ("is_log", is_log), ("is_rewatch", is_rewatch),
                      ("episode_number", episode_number), ("tags", tags),
                      ("allows_comments", allows_comments), ("like", like)]:
             if v is not None:
                 payload[k] = v
-        self._request("POST", "/api/show/reviews/update", json=payload)
+                updates[k] = v
+        resp = self._request_response("POST", "/api/show/reviews/update", json=payload)
+        if resp.status_code >= 500:
+            self._replace_review(review_id, updates)
+            print(f"Review {review_id} replaced after update endpoint failed.")
+            return
+        if resp.status_code >= 400:
+            try:
+                err = resp.json()
+                print(f"Error: {err.get('message', resp.text)}", file=sys.stderr)
+            except Exception:
+                print(f"Error ({resp.status_code}): {resp.text[:200]}", file=sys.stderr)
+            sys.exit(1)
         print(f"Review {review_id} updated.")
 
     def review_delete(self, review_id):
@@ -540,7 +600,7 @@ def _ranged_rating(v):
     v = float(v)
     if v < 0.5 or v > 5.0:
         raise argparse.ArgumentTypeError("rating must be between 0.5 and 5.0")
-    return v
+    return int(v * 2 + 0.5) / 2
 
 
 def main():
