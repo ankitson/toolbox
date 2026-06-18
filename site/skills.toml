@@ -1,0 +1,47 @@
+# External skill sources copied into skills/ by bin/skillctl sync.
+# Any skill directory not listed here is custom and edited locally.
+
+[skills.agent-browser]
+repo = "vercel-labs/agent-browser"
+
+[skills.anthropics]
+repo = "anthropics/skills"
+path = "skills/{claude-api,skill-creator}"
+
+[skills.autoreview]
+repo = "openclaw/agent-skills"
+path = "skills/autoreview"
+
+[skills.job-search]
+repo = "ssh://git@git.home.ankitson.com:1024/ankitson/job-search.git"
+path = "skills/job-search"
+
+[skills.last30days]
+repo = "mvanhorn/last30days-skill"
+path = "skills/last30days"
+
+[skills.qmd]
+repo = "tobi/qmd"
+path = "skills/qmd"
+
+[skills.rdt-cli]
+repo = "public-clis/rdt-cli"
+files = ["SKILL.md", "SCHEMA.md"]
+
+[skills.webby]
+repo = "ankitson/webby"
+
+[routers.agent-workflows]
+title = "Agent Workflows"
+description = "Skills for structured agent collaboration workflows: planning grill sessions, documentation-backed grilling, issue triage, and zooming out for broader context."
+absorbs = ["mattpocock/skills:skills/productivity/grill-me", "mattpocock/skills:skills/engineering/grill-with-docs", "mattpocock/skills:skills/engineering/triage", "local:vendor/skills/mattpocock/zoom-out"]
+
+[routers.cloudflare]
+title = "Cloudflare Platform"
+description = "Skills for Cloudflare development across Workers, Agents SDK, Durable Objects, Wrangler, web performance, sandboxed execution, email service, and Workers best practices."
+absorbs = ["cloudflare/skills:skills/cloudflare", "cloudflare/skills:skills/agents-sdk", "cloudflare/skills:skills/durable-objects", "cloudflare/skills:skills/sandbox-sdk", "cloudflare/skills:skills/wrangler", "cloudflare/skills:skills/web-perf", "cloudflare/skills:skills/cloudflare-email-service", "cloudflare/skills:skills/workers-best-practices"]
+
+[routers.minimalist-entrepreneur]
+title = "Minimalist Entrepreneur"
+description = "Skills for Sahil Lavingia-style minimalist business workflows: finding a community, validating ideas, processizing, building MVPs, pricing, selling to first customers, marketing, growing sustainably, reviewing decisions, and defining company values."
+absorbs = ["slavingia/skills:skills/find-community", "slavingia/skills:skills/validate-idea", "slavingia/skills:skills/processize", "slavingia/skills:skills/mvp", "slavingia/skills:skills/pricing", "slavingia/skills:skills/first-customers", "slavingia/skills:skills/marketing-plan", "slavingia/skills:skills/grow-sustainably", "slavingia/skills:skills/minimalist-review", "slavingia/skills:skills/company-values"]

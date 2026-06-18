@@ -3,6 +3,8 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "mkdocs-material",
+#   "pathspec",
+#   "pyyaml",
 # ]
 # ///
 """Build or serve a quick MkDocs site from Markdown files."""
@@ -10,27 +12,53 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from dataclasses import dataclass, field
 import json
 import os
+import posixpath
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from urllib.parse import unquote
+
+import pathspec
+import yaml
 
 
 DEFAULT_DEPTH = 3
-IGNORED_DIRS = {
+DEFAULT_MAX_LINKED_FILE_SIZE_MIB = 25
+LINK_RE = re.compile(r"(!?\[[^\]]*\]\()(<[^>\n]+>|[^)\s]+)([^)]*\))")
+FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*(?:\n|$)", re.DOTALL)
+HEADING_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
+HEAVY_IGNORED_DIRS = {
+    ".docme",
     ".git",
     ".hg",
     ".svn",
     ".venv",
     "__pycache__",
     "node_modules",
-    "site",
     "venv",
 }
+ROOT_INDEX_SOURCE_NAME = "root-index.md"
+
+
+@dataclass(frozen=True)
+class Page:
+    source: Path
+    source_rel: Path
+    staged_rel: Path
+    title: str
+
+
+@dataclass
+class NavNode:
+    pages: list[Page] = field(default_factory=list)
+    dirs: dict[str, "NavNode"] = field(default_factory=dict)
 
 
 def main() -> int:
@@ -54,6 +82,15 @@ def main() -> int:
         "--site-name",
         help="site title for generated MkDocs config (default: title-cased root name)",
     )
+    parser.add_argument(
+        "--max-linked-file-size-mib",
+        type=int,
+        default=DEFAULT_MAX_LINKED_FILE_SIZE_MIB,
+        help=(
+            "maximum size for linked non-Markdown files to include, in MiB "
+            f"(default: {DEFAULT_MAX_LINKED_FILE_SIZE_MIB}; 0 disables the limit)"
+        ),
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
     build_parser = subparsers.add_parser("build", help="build a static site")
@@ -63,6 +100,11 @@ def main() -> int:
         type=Path,
         default=Path("site"),
         help="output directory for the built site (default: ./site)",
+    )
+    build_parser.add_argument(
+        "--write-mkdocs-yml",
+        action="store_true",
+        help="write an inferred mkdocs.yml in the root directory and exit",
     )
 
     serve_parser = subparsers.add_parser("serve", help="serve the generated site locally")
@@ -78,20 +120,45 @@ def main() -> int:
         type=Path,
         help="site output directory for MkDocs serve (default: temporary directory)",
     )
+    serve_parser.add_argument(
+        "--write-mkdocs-yml",
+        action="store_true",
+        help="write an inferred mkdocs.yml in the root directory and exit",
+    )
 
     args = parser.parse_args()
     root = args.root.resolve()
     if args.depth < 0:
         parser.error("--depth must be >= 0")
+    if args.max_linked_file_size_mib < 0:
+        parser.error("--max-linked-file-size-mib must be >= 0")
     if not root.is_dir():
         parser.error(f"--root is not a directory: {root}")
 
     config = existing_config(root)
     site_name = args.site_name or title_from_dir(root)
+    max_linked_file_size = args.max_linked_file_size_mib * 1024 * 1024
     if args.command == "build":
-        return build(root, config, args.depth, args.output, site_name)
+        return build(
+            root,
+            config,
+            args.depth,
+            args.output,
+            site_name,
+            max_linked_file_size,
+            args.write_mkdocs_yml,
+        )
     if args.command == "serve":
-        return serve(root, config, args.depth, args.output, args.dev_addr, site_name)
+        return serve(
+            root,
+            config,
+            args.depth,
+            args.output,
+            args.dev_addr,
+            site_name,
+            max_linked_file_size,
+            args.write_mkdocs_yml,
+        )
 
     parser.error(f"unknown command: {args.command}")
     return 2
@@ -103,13 +170,17 @@ def build(
     depth: int,
     output: Path,
     site_name: str,
+    max_linked_file_size: int,
+    write_mkdocs_yml: bool,
 ) -> int:
+    if write_mkdocs_yml:
+        return write_inferred_mkdocs_yml(root, config, depth, site_name, max_linked_file_size)
+
     output_dir = output if output.is_absolute() else root / output
     if config is not None:
         return run(
             mkdocs(
                 "build",
-                "--strict",
                 "--config-file",
                 str(config),
                 "--site-dir",
@@ -122,9 +193,9 @@ def build(
     with tempfile.TemporaryDirectory(prefix="docme-") as temp:
         temp_path = Path(temp)
         docs_dir = temp_path / "docs"
-        stage_markdown(root, markdown_files, docs_dir)
-        config_path = write_config(temp_path, docs_dir, output_dir, site_name)
-        return run(mkdocs("build", "--strict", "--config-file", str(config_path)), root)
+        pages = stage_markdown(root, markdown_files, docs_dir, max_linked_file_size)
+        config_path = write_config(temp_path, docs_dir, output_dir, site_name, pages)
+        return run(mkdocs("build", "--config-file", str(config_path)), root)
 
 
 def serve(
@@ -134,7 +205,12 @@ def serve(
     output: Path | None,
     dev_addr: str,
     site_name: str,
+    max_linked_file_size: int,
+    write_mkdocs_yml: bool,
 ) -> int:
+    if write_mkdocs_yml:
+        return write_inferred_mkdocs_yml(root, config, depth, site_name, max_linked_file_size)
+
     if config is not None:
         if output is not None:
             print(
@@ -150,8 +226,8 @@ def serve(
         site_dir = output if output is not None else temp_path / "site"
         if not site_dir.is_absolute():
             site_dir = root / site_dir
-        stage_markdown(root, markdown_files, docs_dir)
-        config_path = write_config(temp_path, docs_dir, site_dir, site_name)
+        pages = stage_markdown(root, markdown_files, docs_dir, max_linked_file_size)
+        config_path = write_config(temp_path, docs_dir, site_dir, site_name, pages)
         return run(
             mkdocs(
                 "serve",
@@ -182,7 +258,12 @@ def discover_markdown_or_exit(root: Path, depth: int) -> list[Path]:
 
 
 def discover_markdown(root: Path, max_depth: int) -> list[Path]:
+    git_files = discover_markdown_with_git(root, max_depth)
+    if git_files is not None:
+        return git_files
+
     files: list[Path] = []
+    ignore_spec = gitignore_spec(root)
     for current, dirnames, filenames in os.walk(root):
         current_path = Path(current)
         relative_dir = current_path.relative_to(root)
@@ -191,54 +272,473 @@ def discover_markdown(root: Path, max_depth: int) -> list[Path]:
         dirnames[:] = [
             name
             for name in dirnames
-            if dir_depth < max_depth and name not in IGNORED_DIRS and not name.startswith(".")
+            if dir_depth < max_depth
+            and name not in HEAVY_IGNORED_DIRS
+            and not is_ignored(ignore_spec, (current_path / name).relative_to(root), is_dir=True)
         ]
 
         for filename in filenames:
-            if filename.lower().endswith(".md"):
-                files.append(current_path / filename)
+            path = current_path / filename
+            relative = path.relative_to(root)
+            if filename.lower().endswith(".md") and within_depth(relative, max_depth) and not is_ignored(
+                ignore_spec,
+                relative,
+            ):
+                files.append(path)
     return sorted(files, key=lambda path: path.relative_to(root).as_posix().lower())
 
 
-def stage_markdown(root: Path, markdown_files: list[Path], docs_dir: Path) -> None:
+def discover_markdown_with_git(root: Path, max_depth: int) -> list[Path] | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    files = []
+    for raw_path in result.stdout.decode("utf-8", errors="replace").split("\0"):
+        if not raw_path:
+            continue
+        relative = Path(raw_path)
+        path = root / relative
+        if (
+            relative.suffix.lower() == ".md"
+            and within_depth(relative, max_depth)
+            and path.is_file()
+            and not any(part in HEAVY_IGNORED_DIRS for part in relative.parts)
+        ):
+            files.append(path)
+    return sorted(files, key=lambda path: path.relative_to(root).as_posix().lower())
+
+
+def within_depth(relative: Path, max_depth: int) -> bool:
+    return len(relative.parent.parts) <= max_depth
+
+
+def gitignore_spec(root: Path) -> pathspec.PathSpec:
+    gitignore = root / ".gitignore"
+    if not gitignore.exists():
+        return pathspec.PathSpec.from_lines("gitwildmatch", [])
+    return pathspec.PathSpec.from_lines(
+        "gitwildmatch",
+        gitignore.read_text(encoding="utf-8").splitlines(),
+    )
+
+
+def is_ignored(spec: pathspec.PathSpec, relative: Path, is_dir: bool = False) -> bool:
+    path = relative.as_posix()
+    if is_dir:
+        path += "/"
+    return spec.match_file(path)
+
+
+def stage_markdown(
+    root: Path,
+    markdown_files: list[Path],
+    docs_dir: Path,
+    max_linked_file_size: int,
+) -> list[Page]:
     docs_dir.mkdir(parents=True, exist_ok=True)
-    has_root_index = False
-    staged_rel_paths: list[Path] = []
+    markdown_map, asset_map, link_targets, skipped_rewrites, skipped = collect_linked_files(
+        root,
+        markdown_files,
+        max_linked_file_size,
+    )
+    staged_markdown = staged_markdown_paths(markdown_map)
+    staged_assets = staged_asset_paths(asset_map, set(staged_markdown.values()) | {Path("index.md")})
+    pages = pages_from_markdown(root, markdown_map, staged_markdown)
+    rewrites = build_rewrites(staged_markdown, staged_assets, link_targets, skipped_rewrites)
 
-    for source in markdown_files:
-        relative = source.relative_to(root)
-        if len(relative.parts) == 1 and relative.name.lower() in {"index.md", "readme.md"}:
-            has_root_index = True
-        target = docs_dir / relative
+    for source in sorted(markdown_map, key=lambda path: markdown_map[path].as_posix().lower()):
+        target = docs_dir / staged_markdown[source]
         target.parent.mkdir(parents=True, exist_ok=True)
+        text = source.read_text(encoding="utf-8")
+        text = rewrite_links(text, source, rewrites)
+        target.write_text(text, encoding="utf-8")
+
+    for source, relative in sorted(staged_assets.items(), key=lambda item: item[1].as_posix().lower()):
+        stage_file(source, docs_dir / relative)
+
+    write_homepage(docs_dir / "index.md", pages)
+    report_skipped(skipped)
+    return pages
+
+
+def collect_linked_files(
+    root: Path,
+    markdown_files: list[Path],
+    max_linked_file_size: int,
+) -> tuple[
+    dict[Path, Path],
+    dict[Path, Path],
+    dict[tuple[Path, str], tuple[Path, str]],
+    dict[tuple[Path, str], str],
+    list[tuple[Path, str, Path, str]],
+]:
+    markdown_map = {source: source.relative_to(root) for source in markdown_files}
+    asset_map: dict[Path, Path] = {}
+    link_targets: dict[tuple[Path, str], tuple[Path, str]] = {}
+    skipped_rewrites: dict[tuple[Path, str], str] = {}
+    skipped: list[tuple[Path, str, Path, str]] = []
+    skipped_seen: set[tuple[Path, str, Path, str]] = set()
+    queue = deque(markdown_files)
+    seen = set(markdown_files)
+
+    while queue:
+        markdown = queue.popleft()
         try:
-            target.symlink_to(source)
-        except OSError:
-            shutil.copy2(source, target)
-        staged_rel_paths.append(relative)
+            text = markdown.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
 
-    if not has_root_index:
-        write_index(docs_dir / "index.md", staged_rel_paths)
+        for raw_target in iter_link_targets(text):
+            resolved, suffix = resolve_link(markdown, raw_target)
+            if resolved is None:
+                continue
+
+            staged_rel = staged_relative_path(root, resolved)
+            if staged_rel is None:
+                add_skipped(skipped, skipped_seen, markdown, raw_target, resolved, "outside root")
+                skipped_rewrites[(markdown, raw_target)] = file_uri(resolved, suffix)
+                continue
+
+            if not resolved.is_file():
+                add_skipped(skipped, skipped_seen, markdown, raw_target, resolved, "missing")
+                skipped_rewrites[(markdown, raw_target)] = file_uri(resolved, suffix)
+                continue
+
+            if is_too_large(resolved, max_linked_file_size):
+                add_skipped(skipped, skipped_seen, markdown, raw_target, resolved, "too large")
+                skipped_rewrites[(markdown, raw_target)] = file_uri(resolved, suffix)
+                continue
+
+            link_targets[(markdown, raw_target)] = (resolved, suffix)
+            if resolved.suffix.lower() == ".md":
+                if resolved not in markdown_map:
+                    markdown_map[resolved] = staged_rel
+                if resolved not in seen:
+                    seen.add(resolved)
+                    queue.append(resolved)
+            else:
+                asset_map.setdefault(resolved, staged_rel)
+
+    return markdown_map, asset_map, link_targets, skipped_rewrites, skipped
 
 
-def write_index(path: Path, markdown_files: list[Path]) -> None:
-    links = []
-    for relative in markdown_files:
-        href = relative.as_posix()
-        label = title_from_path(relative)
-        links.append(f"- [{label}]({href})")
+def add_skipped(
+    skipped: list[tuple[Path, str, Path, str]],
+    seen: set[tuple[Path, str, Path, str]],
+    source: Path,
+    raw_target: str,
+    resolved: Path,
+    reason: str,
+) -> None:
+    entry = (source, raw_target, resolved, reason)
+    if entry in seen:
+        return
+    seen.add(entry)
+    skipped.append(entry)
 
-    body = "# Docs\n\n" + "\n".join(links) + "\n"
-    path.write_text(body, encoding="utf-8")
+
+def iter_link_targets(text: str) -> list[str]:
+    return [match.group(2) for match in LINK_RE.finditer(text)]
 
 
-def write_config(temp_path: Path, docs_dir: Path, site_dir: Path, site_name: str) -> Path:
+def resolve_link(source: Path, raw_target: str) -> tuple[Path | None, str]:
+    target = raw_target.strip()
+    if target.startswith("<") and target.endswith(">"):
+        target = target[1:-1]
+    if not target or target.startswith("#") or is_external_link(target):
+        return None, ""
+
+    path_text, suffix = split_link_suffix(target)
+    path_text = unquote(path_text)
+    if not path_text:
+        return None, suffix
+
+    candidates = []
+    path = Path(path_text).expanduser()
+    if path.is_absolute():
+        candidates.append(path.resolve(strict=False))
+    else:
+        candidates.append((source.parent / path).resolve(strict=False))
+        absolute = absolute_from_escaped_path(path_text)
+        if absolute is not None:
+            candidates.append(absolute)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve(), suffix
+    return (candidates[0], suffix) if candidates else (None, suffix)
+
+
+def is_external_link(target: str) -> bool:
+    return bool(re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target)) or target.startswith("//")
+
+
+def split_link_suffix(target: str) -> tuple[str, str]:
+    positions = [pos for pos in (target.find("#"), target.find("?")) if pos >= 0]
+    if not positions:
+        return target, ""
+    split_at = min(positions)
+    return target[:split_at], target[split_at:]
+
+
+def absolute_from_escaped_path(path_text: str) -> Path | None:
+    parts = Path(path_text).parts
+    while parts and parts[0] == "..":
+        parts = parts[1:]
+    if not parts:
+        return None
+    candidate = Path("/") / Path(*parts)
+    return candidate if candidate.exists() else None
+
+
+def staged_relative_path(root: Path, source: Path) -> Path | None:
+    try:
+        return source.relative_to(root)
+    except ValueError:
+        return None
+
+
+def file_uri(path: Path, suffix: str) -> str:
+    return f"{path.resolve(strict=False).as_uri()}{suffix}"
+
+
+def is_too_large(path: Path, max_linked_file_size: int) -> bool:
+    if max_linked_file_size == 0:
+        return False
+    try:
+        return path.stat().st_size > max_linked_file_size
+    except OSError:
+        return False
+
+
+def staged_markdown_paths(markdown_map: dict[Path, Path]) -> dict[Path, Path]:
+    staged: dict[Path, Path] = {}
+    used = {"index.md"}
+
+    for source, relative in sorted(markdown_map.items(), key=lambda item: item[1].as_posix().lower()):
+        candidate = safe_staged_path(relative)
+        if len(relative.parts) == 1 and relative.name.lower() == "readme.md":
+            candidate = Path(relative.stem) / "index.md"
+        if len(relative.parts) == 1 and relative.name.lower() == "index.md":
+            candidate = Path(ROOT_INDEX_SOURCE_NAME)
+
+        original_candidate = candidate
+        counter = 2
+        while candidate.as_posix().lower() in used:
+            candidate = original_candidate.with_name(
+                f"{original_candidate.stem}-{counter}{original_candidate.suffix}"
+            )
+            counter += 1
+
+        used.add(candidate.as_posix().lower())
+        staged[source] = candidate
+
+    return staged
+
+
+def staged_asset_paths(asset_map: dict[Path, Path], reserved: set[Path]) -> dict[Path, Path]:
+    staged: dict[Path, Path] = {}
+    used = {path.as_posix().lower() for path in reserved}
+
+    for source, relative in sorted(asset_map.items(), key=lambda item: item[1].as_posix().lower()):
+        candidate = safe_staged_path(relative)
+        original_candidate = candidate
+        counter = 2
+        while candidate.as_posix().lower() in used:
+            candidate = original_candidate.with_name(
+                f"{original_candidate.stem}-{counter}{original_candidate.suffix}"
+            )
+            counter += 1
+
+        used.add(candidate.as_posix().lower())
+        staged[source] = candidate
+
+    return staged
+
+
+def safe_staged_path(relative: Path) -> Path:
+    parts = [f"_{part[1:]}" if part.startswith(".") else part for part in relative.parts]
+    return Path(*parts)
+
+
+def pages_from_markdown(root: Path, markdown_map: dict[Path, Path], staged: dict[Path, Path]) -> list[Page]:
+    pages = []
+    for source, relative in markdown_map.items():
+        pages.append(
+            Page(
+                source=source,
+                source_rel=relative,
+                staged_rel=staged[source],
+                title=page_title(source, relative),
+            )
+        )
+    return sorted(pages, key=lambda page: page.source_rel.as_posix().lower())
+
+
+def build_rewrites(
+    staged_markdown: dict[Path, Path],
+    asset_map: dict[Path, Path],
+    link_targets: dict[tuple[Path, str], tuple[Path, str]],
+    skipped_rewrites: dict[tuple[Path, str], str],
+) -> dict[tuple[Path, str], str]:
+    rewrites = dict(skipped_rewrites)
+    for key, (resolved, suffix) in link_targets.items():
+        source, raw_target = key
+        source_rel = staged_markdown.get(source)
+        target_rel = staged_markdown.get(resolved) or asset_map.get(resolved)
+        if source_rel is None or target_rel is None:
+            continue
+        rewrites[(source, raw_target)] = relative_link(source_rel, target_rel, suffix)
+    return rewrites
+
+
+def relative_link(source_rel: Path, target_rel: Path, suffix: str) -> str:
+    source_parent = source_rel.parent.as_posix()
+    if source_parent == ".":
+        source_parent = ""
+    href = posixpath.relpath(target_rel.as_posix(), start=source_parent or ".")
+    return f"{href}{suffix}"
+
+
+def rewrite_links(text: str, source: Path, rewrites: dict[tuple[Path, str], str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        raw_target = match.group(2)
+        replacement = rewrites.get((source, raw_target))
+        if replacement is None:
+            return match.group(0)
+        return f"{match.group(1)}{replacement}{match.group(3)}"
+
+    return LINK_RE.sub(replace, text)
+
+
+def stage_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target.symlink_to(source)
+    except OSError:
+        shutil.copy2(source, target)
+
+
+def report_skipped(skipped: list[tuple[Path, str, Path, str]]) -> None:
+    if not skipped:
+        return
+
+    print(f"docme: skipped {len(skipped)} linked file(s):", file=sys.stderr)
+    for source, raw_target, resolved, reason in skipped[:25]:
+        print(
+            f"  - {source}: {raw_target} -> {resolved} ({reason})",
+            file=sys.stderr,
+        )
+    remaining = len(skipped) - 25
+    if remaining > 0:
+        print(f"  ... {remaining} more", file=sys.stderr)
+
+
+def write_homepage(path: Path, pages: list[Page]) -> None:
+    root_pages = [page for page in pages if len(page.source_rel.parts) == 1]
+    directory_pages: dict[str, Page] = {}
+    for page in pages:
+        if len(page.source_rel.parts) > 1:
+            directory_pages.setdefault(page.source_rel.parts[0], page)
+
+    lines = ["# Docs", ""]
+    if root_pages:
+        lines.extend(["## Root files", ""])
+        for page in sorted(root_pages, key=lambda item: item.source_rel.name.lower()):
+            lines.append(f"- [{page.title}]({page.staged_rel.as_posix()})")
+        lines.append("")
+
+    if directory_pages:
+        lines.extend(["## Directories", ""])
+        for directory, first_page in sorted(directory_pages.items(), key=lambda item: item[0].lower()):
+            lines.append(f"- [{directory}/]({first_page.staged_rel.as_posix()})")
+        lines.append("")
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def build_nav(pages: list[Page], include_home: bool) -> list[dict[str, object]]:
+    root = NavNode()
+    for page in pages:
+        node = root
+        for part in page.source_rel.parts[:-1]:
+            node = node.dirs.setdefault(part, NavNode())
+        node.pages.append(page)
+
+    nav: list[dict[str, object]] = []
+    if include_home:
+        nav.append({"Home": "index.md"})
+    nav.extend(node_to_nav(root))
+    return nav
+
+
+def node_to_nav(node: NavNode) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for page in sorted(node.pages, key=lambda item: item.source_rel.name.lower()):
+        entries.append({page.title: page.staged_rel.as_posix()})
+    for dirname, child in sorted(node.dirs.items(), key=lambda item: item[0].lower()):
+        child_entries = node_to_nav(child)
+        if child_entries:
+            entries.append({title_from_text(dirname) or dirname: child_entries})
+    return entries
+
+
+def write_inferred_mkdocs_yml(
+    root: Path,
+    config: Path | None,
+    depth: int,
+    site_name: str,
+    max_linked_file_size: int,
+) -> int:
+    if config is not None:
+        print(f"docme: refusing to overwrite existing MkDocs config: {config}", file=sys.stderr)
+        return 1
+
+    markdown_files = discover_markdown_or_exit(root, depth)
+    docs_dir = root / ".docme" / "docs"
+    if docs_dir.exists():
+        shutil.rmtree(docs_dir)
+    pages = stage_markdown(root, markdown_files, docs_dir, max_linked_file_size)
+    config_path = root / "mkdocs.yml"
+    write_config_file(config_path, Path(".docme/docs"), Path("site"), site_name, build_nav(pages, include_home=True))
+    print(f"docme: wrote {config_path} and {docs_dir}")
+    return 0
+
+
+def write_config(temp_path: Path, docs_dir: Path, site_dir: Path, site_name: str, pages: list[Page]) -> Path:
     config_path = temp_path / "mkdocs.yml"
+    write_config_file(config_path, docs_dir, site_dir, site_name, build_nav(pages, include_home=True))
+    return config_path
+
+
+def write_config_file(
+    config_path: Path,
+    docs_dir: Path,
+    site_dir: Path,
+    site_name: str,
+    nav: list[dict[str, object]],
+) -> None:
+    nav_text = indent(yaml.safe_dump(nav, sort_keys=False, allow_unicode=True), "  ")
     config = f"""site_name: {json.dumps(site_name)}
 docs_dir: {json.dumps(str(docs_dir))}
 site_dir: {json.dumps(str(site_dir))}
 theme:
   name: material
+  palette:
+    scheme: slate
+  font:
+    text: IBM Plex Sans
+    code: IBM Plex Mono
 markdown_extensions:
   - admonition
   - tables
@@ -249,9 +749,47 @@ markdown_extensions:
       permalink: true
       slugify: !!python/object/apply:pymdownx.slugs.slugify
         kwds: {{case: lower, percent_encode: false}}
-"""
+nav:
+{nav_text}"""
     config_path.write_text(config, encoding="utf-8")
-    return config_path
+
+
+def indent(text: str, prefix: str) -> str:
+    return "".join(f"{prefix}{line}" if line.strip() else line for line in text.splitlines(keepends=True))
+
+
+def page_title(path: Path, relative: Path) -> str:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return title_from_path(relative)
+
+    metadata = frontmatter(text)
+    title = metadata.get("title")
+    if title:
+        return str(title).strip()
+    name = metadata.get("name")
+    if name:
+        return title_from_text(str(name)) or str(name).strip()
+
+    if len(relative.parts) == 1:
+        return title_from_path(relative)
+
+    heading = HEADING_RE.search(text)
+    if heading:
+        return heading.group(1).strip()
+    return title_from_path(relative)
+
+
+def frontmatter(text: str) -> dict[str, object]:
+    match = FRONTMATTER_RE.match(text)
+    if not match:
+        return {}
+    try:
+        value = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def mkdocs(*args: str) -> list[str]:
@@ -270,13 +808,18 @@ def title_from_dir(path: Path) -> str:
 
 
 def title_from_path(path: Path) -> str:
-    stem = path.with_suffix("").as_posix()
+    stem = path.with_suffix("").name
     return title_from_text(stem) or stem
 
 
 def title_from_text(text: str) -> str:
-    words = re.split(r"[^A-Za-z0-9]+", text)
-    return " ".join(word.capitalize() for word in words if word)
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    if stripped.isupper() and any(char.isalpha() for char in stripped):
+        return stripped
+    words = re.split(r"[^A-Za-z0-9]+", stripped)
+    return " ".join(word if word.isupper() else word.capitalize() for word in words if word)
 
 
 def shlex_join(args: list[str]) -> str:

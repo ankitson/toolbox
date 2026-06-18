@@ -158,3 +158,13 @@
 - `docme` uses an existing `mkdocs.yml`/`mkdocs.yaml` in the root directory before falling back to generated Markdown staging.
 - Generated fallback config uses the `pymdownx.slugs.slugify` GitHub-compatible slugifier so hand-written anchors with punctuation resolve.
 - `docme` sets `NO_MKDOCS_2_WARNING=true` for MkDocs subprocesses to suppress Material's MkDocs 2.0 banner while preserving normal build output.
+- Fallback staging now includes local files linked from Markdown, using symlinks where possible and copies as a fallback.
+- `docme` no longer runs MkDocs in strict mode; skipped missing, outside-root, or over-size linked files are reported separately.
+- Added a configurable linked-file size cap, defaulting to 25 MiB via `--max-linked-file-size-mib`.
+- Generated fallback sites default to Material's slate palette with IBM Plex Sans text and IBM Plex Mono code fonts.
+
+## 2026-06-12
+
+### Docme
+- Generated fallback sites now always include a `Docs` listing page.
+- When a project already has a root `README.md` or `index.md`, `docme` keeps that homepage and writes the listing to `docs.md` or the next available fallback name.
