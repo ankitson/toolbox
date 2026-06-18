@@ -22,6 +22,9 @@ skills-sync *names:
 skills-add source *args:
   @bin/skillctl add {{source}} {{args}}
 
+skills-router name *args:
+  @bin/skillctl router {{name}} {{args}}
+
 web-clip url output="clips":
   @bin/web-clip {{url}} -o {{output}}
 

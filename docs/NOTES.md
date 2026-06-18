@@ -1,5 +1,46 @@
 # Toolbox Notes
 
+## 2026-06-18 — Portable skill router generation
+
+### Goal
+- Add a `skillctl` workflow for turning a related set of installed skills into
+  one portable router skill, starting with the Sahil Lavingia minimalist
+  entrepreneur skills.
+
+### Decisions
+- Keep `.skillctl-source` as a registry-label ownership marker. It continues to
+  contain values like `slavingia`, not repo provenance such as
+  `slavingia/skills`; the authoritative repo and path stay in `skills.toml`.
+- Add `bin/skillctl router <name>` as the generator interface. It accepts
+  explicit installed skill names, `--group <title>` for semantic groupings in
+  `skills.sh.json`, and `--source-group <label>` as a fallback for skills copied
+  by a glob registry entry.
+- Make router sync the default "one visible router" workflow. It bundles
+  selected skills into `references/<skill>/instructions.md` and removes their
+  top-level active skill directories while preserving provenance in
+  `skills.toml`.
+- Move router membership and provenance into `skills.toml` router tables. Router
+  `absorbs` entries use `repo:path` specs, with `local:path` reserved for
+  locally vendored historical sources.
+- Add root `skills.sh.json` using the existing Skills.sh grouping convention.
+  This file is generated from `skills.toml` routers; `.skillctl-source` remains
+  only a sync ownership marker.
+- Render the router `SKILL.md` from
+  `templates/skillctl/router.SKILL.md` using Python's stdlib
+  `string.Template`, keeping the template separate without adding a runtime
+  dependency.
+- Copy selected skills into `references/<skill-name>/`, rename bundled
+  `SKILL.md` files to `instructions.md`, and omit `.skillctl-source` markers
+  from the bundled references. This prevents recursive skill scanners from
+  discovering bundled references as duplicate skills.
+- Generate `skills/minimalist-entrepreneur` from the
+  `routers.minimalist-entrepreneur` `skills.toml` table as the first absorbed
+  router skill.
+- Add absorbed routers for Cloudflare platform skills and agent workflow skills.
+  `zoom-out` was removed upstream from `mattpocock/skills`, so its last upstream
+  copy from commit `801a01cc7d265e06dd9dbcef5a4c471add05a0b3` is vendored under
+  `vendor/skills/mattpocock/zoom-out` and referenced with a `local:` absorb.
+
 ## 2026-06-11 — Remeddy remote editor launcher
 
 ### Goal

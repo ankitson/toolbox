@@ -56,6 +56,7 @@ just skills-sync                         # refresh every external skill
 just skills-sync qmd                     # refresh selected skills
 just skills-add vercel-labs/agent-browser
 just skills-add qmd tobi/qmd skills/qmd  # explicit name/repo/path fallback
+just skills-router minimalist-entrepreneur
 ```
 
 For selected-file imports or pinned refs, call `bin/skillctl` directly:
@@ -63,6 +64,25 @@ For selected-file imports or pinned refs, call `bin/skillctl` directly:
 ```sh
 bin/skillctl add rdt-cli public-clis/rdt-cli --file SKILL.md --file SCHEMA.md
 bin/skillctl add example owner/repo path/to/skill --ref v1.0.0
+bin/skillctl router bundle-name skill-one skill-two
+bin/skillctl router bundle-name --group "Group Title" --description "Route related workflows."
+bin/skillctl router bundle-name --source-group registry-label
+```
+
+Router skills are portable Agent Skills that keep one `SKILL.md` as the entry
+point and copy the selected skills under `references/<skill-name>/`. The
+generated router tells the agent which `instructions.md` reference to load
+instead of loading every bundled workflow up front. Bundled references are not
+named `SKILL.md`, so recursive skill scanners do not discover them as separate
+skills. Router definitions in `skills.toml` are materialized and absorbed by
+default during `skillctl sync`; `skills.sh.json` is generated from those router
+definitions:
+
+```toml
+[routers.example]
+title = "Example Bundle"
+description = "Related workflows."
+absorbs = ["owner/repo:skills/alpha", "local:vendor/skills/example/beta"]
 ```
 
 Summarize URLs, files, media, or stdin through the steipete CLI without

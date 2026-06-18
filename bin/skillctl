@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 import shutil
+from string import Template
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,8 @@ from typing import Any
 SKILL_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 GLOB_SOURCE_MARKER = ".skillctl-source"
 GLOB_CHARS = frozenset("*?[{")
+TOOL_ROOT = Path(__file__).resolve().parent.parent
+ROUTER_TEMPLATE = TOOL_ROOT / "templates" / "skillctl" / "router.SKILL.md"
 
 
 def _is_glob(path: str) -> bool:
@@ -34,6 +37,22 @@ def _expand_braces(pattern: str) -> list[str]:
     for alt in alts:
         result.extend(_expand_braces(prefix + alt + suffix))
     return result
+
+
+def _title_from_name(name: str) -> str:
+    return " ".join(part.capitalize() for part in re.split(r"[-_]+", name) if part)
+
+
+def _frontmatter_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _name_from_absorb(spec: str) -> str:
+    path = spec.split(":", 1)[-1].rstrip("/")
+    return path.rsplit("/", 1)[-1]
 
 
 class SkillctlError(RuntimeError):
@@ -58,40 +77,53 @@ def run(*args: str, cwd: Path | None = None) -> str:
     return completed.stdout.strip()
 
 
+def render_template(path: Path, values: dict[str, str]) -> str:
+    try:
+        template = Template(path.read_text())
+    except OSError as exc:
+        raise SkillctlError(f"cannot read template {path}: {exc}") from exc
+    try:
+        return template.substitute(values)
+    except (KeyError, ValueError) as exc:
+        raise SkillctlError(f"cannot render template {path}: {exc}") from exc
+
+
 class SkillManager:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
         self.registry_path = self.root / "skills.toml"
         self.skills_dir = self.root / "skills"
-        self.sources = self.load_registry()
+        self.sources, self.routers = self.load_registry()
 
-    def load_registry(self) -> dict[str, dict[str, Any]]:
+    def load_registry(self) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         if not self.registry_path.exists():
-            return {}
+            return {}, {}
         try:
             return self.parse_registry(self.registry_path.read_text())
         except (OSError, ValueError) as exc:
             raise SkillctlError(f"cannot read {self.registry_path}: {exc}") from exc
 
     @staticmethod
-    def parse_registry(content: str) -> dict[str, dict[str, Any]]:
+    def parse_registry(content: str) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         """Parse the small TOML subset emitted by save_registry."""
         sources: dict[str, dict[str, Any]] = {}
+        routers: dict[str, dict[str, Any]] = {}
         current: dict[str, Any] | None = None
         for line_number, raw_line in enumerate(content.splitlines(), 1):
             line = raw_line.strip()
             if not line or line.startswith("#"):
                 continue
-            table = re.fullmatch(r"\[skills\.([a-z0-9][a-z0-9_-]*)\]", line)
+            table = re.fullmatch(r"\[(skills|routers)\.([a-z0-9][a-z0-9_-]*)\]", line)
             if table:
-                name = table.group(1)
-                if name in sources:
-                    raise ValueError(f"line {line_number}: duplicate skill table {name!r}")
-                current = sources.setdefault(name, {})
+                section, name = table.groups()
+                registry = sources if section == "skills" else routers
+                if name in registry:
+                    raise ValueError(f"line {line_number}: duplicate {section} table {name!r}")
+                current = registry.setdefault(name, {})
                 continue
             if current is None:
-                raise ValueError(f"line {line_number}: expected [skills.<name>] table")
-            assignment = re.fullmatch(r"([a-z]+)\s*=\s*(.+)", line)
+                raise ValueError(f"line {line_number}: expected [skills.<name>] or [routers.<name>] table")
+            assignment = re.fullmatch(r"([a-z_]+)\s*=\s*(.+)", line)
             if not assignment:
                 raise ValueError(f"line {line_number}: expected key = value")
             key, value = assignment.groups()
@@ -101,18 +133,24 @@ class SkillManager:
                 current[key] = json.loads(value)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"line {line_number}: value must use TOML basic strings or arrays") from exc
-        return sources
+        return sources, routers
 
     def save_registry(self) -> None:
         lines = [
-            "# External skill sources copied into skills/ by bin/skillctl sync.",
-            "# Any skill directory not listed here is custom and edited locally.",
+            "# Authoritative external skill sources and generated router bundles.",
+            "# Standalone [skills.*] entries materialize as top-level skills.",
+            "# [routers.*].absorbs entries materialize inside router references.",
         ]
         for name, source in sorted(self.sources.items()):
             lines.extend(["", f"[skills.{name}]"])
             for key in ("repo", "ref", "path", "files"):
                 if key in source:
                     lines.append(f"{key} = {json.dumps(source[key])}")
+        for name, router in sorted(self.routers.items()):
+            lines.extend(["", f"[routers.{name}]"])
+            for key in ("title", "description", "absorbs"):
+                if key in router:
+                    lines.append(f"{key} = {json.dumps(router[key])}")
         self.registry_path.write_text("\n".join(lines) + "\n")
 
     @staticmethod
@@ -172,6 +210,89 @@ class SkillManager:
         choices = ", ".join(str(path.relative_to(checkout)) for path in unique)
         raise SkillctlError(f"{name}: multiple skill folders found; pass a path ({choices})")
 
+    @staticmethod
+    def parse_absorb_spec(spec: str) -> tuple[str, str]:
+        if ":" not in spec:
+            raise SkillctlError(f"invalid absorb spec {spec!r}; expected repo:path")
+        repo, path = spec.split(":", 1)
+        if not repo or not path:
+            raise SkillctlError(f"invalid absorb spec {spec!r}; expected repo:path")
+        return repo, path
+
+    def resolve_absorb_sources(self, specs: list[str], temporary: Path) -> dict[str, Path]:
+        grouped: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        for spec in specs:
+            if not isinstance(spec, str) or not spec:
+                raise SkillctlError("router absorbs must be non-empty strings")
+            repo, path = self.parse_absorb_spec(spec)
+            skill_name = _name_from_absorb(spec)
+            self.validate_name(skill_name)
+            grouped.setdefault((repo, path), []).append((skill_name, spec))
+
+        result: dict[str, Path] = {}
+        for index, ((repo, path), entries) in enumerate(grouped.items()):
+            if repo == "local":
+                source_dir = self.child_path(self.root, path, "local absorb")
+                if not (source_dir / "SKILL.md").is_file():
+                    raise SkillctlError(f"local:{path}: source does not contain SKILL.md")
+                for skill_name, _spec in entries:
+                    result[skill_name] = source_dir
+                continue
+            checkout = temporary / f"repo-{index}"
+            run("git", "clone", "--quiet", self.repo_url(repo), str(checkout))
+            run("git", "checkout", "--quiet", "--detach", "main", cwd=checkout)
+            source = {"repo": repo, "path": path}
+            if _is_glob(path):
+                matched = dict(self.resolve_glob_dirs(checkout, repo, source))
+                for skill_name, spec in entries:
+                    if skill_name not in matched:
+                        raise SkillctlError(f"{spec}: matched no skill named {skill_name}")
+                    result[skill_name] = matched[skill_name]
+            else:
+                source_dir = self.child_path(checkout, path, f"{repo}: path")
+                if not (source_dir / "SKILL.md").is_file():
+                    raise SkillctlError(f"{repo}:{path}: source does not contain SKILL.md")
+                for skill_name, _spec in entries:
+                    result[skill_name] = source_dir
+        return result
+
+    def router_by_name(self, name: str) -> dict[str, Any]:
+        router = self.routers.get(name)
+        if router is None:
+            raise SkillctlError(f"router not registered: {name}")
+        return router
+
+    def validate_router_source(self, name: str, router: Any) -> list[str]:
+        errors: list[str] = []
+        try:
+            self.validate_name(name)
+        except SkillctlError as exc:
+            return [str(exc)]
+        if not isinstance(router, dict):
+            return [f"{name}: router must be a TOML table"]
+        allowed = {"title", "description", "absorbs"}
+        unknown = sorted(set(router) - allowed)
+        if unknown:
+            errors.append(f"{name}: unknown router keys: {', '.join(unknown)}")
+        for key in ("title", "description"):
+            if key in router and (not isinstance(router[key], str) or not router[key]):
+                errors.append(f"{name}: {key} must be a non-empty string")
+        absorbs = router.get("absorbs")
+        if (
+            not isinstance(absorbs, list)
+            or not absorbs
+            or not all(isinstance(item, str) and item for item in absorbs)
+        ):
+            errors.append(f"{name}: absorbs must be a non-empty string array")
+        else:
+            for spec in absorbs:
+                try:
+                    self.parse_absorb_spec(spec)
+                    self.validate_name(_name_from_absorb(spec))
+                except SkillctlError as exc:
+                    errors.append(f"{name}: {exc}")
+        return errors
+
     def resolve_glob_dirs(self, checkout: Path, label: str, source: dict[str, Any]) -> list[tuple[str, Path]]:
         """Expand brace patterns and glob to find all matched (skill_name, skill_dir) pairs."""
         pattern = source["path"]
@@ -198,6 +319,92 @@ class SkillManager:
             if marker.is_file() and marker.read_text().strip() == label:
                 owned.append(skill_dir.name)
         return owned
+
+    def read_skill_metadata_file(self, skill_file: Path, name: str) -> dict[str, str]:
+        if not skill_file.is_file():
+            raise SkillctlError(f"{name}: SKILL.md is missing")
+        metadata = {"name": name, "description": ""}
+        lines = skill_file.read_text().splitlines()
+        if not lines or lines[0].strip() != "---":
+            return metadata
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            match = re.fullmatch(r"([A-Za-z0-9_-]+):\s*(.*)", line)
+            if match and match.group(1) in metadata:
+                metadata[match.group(1)] = _frontmatter_value(match.group(2))
+        return metadata
+
+    def read_skill_metadata(self, name: str) -> dict[str, str]:
+        return self.read_skill_metadata_file(self.target(name) / "SKILL.md", name)
+
+    def router_source_dir(self, router_name: str, skill_name: str) -> Path:
+        active = self.target(skill_name)
+        if (active / "SKILL.md").is_file():
+            return active
+        bundled = self.target(router_name) / "references" / skill_name
+        if (bundled / "instructions.md").is_file():
+            return bundled
+        raise SkillctlError(f"{skill_name}: installed skill or bundled router reference not found")
+
+    def router_source_metadata(self, source_dir: Path, skill_name: str) -> dict[str, str]:
+        if (source_dir / "SKILL.md").is_file():
+            return self.read_skill_metadata_file(source_dir / "SKILL.md", skill_name)
+        return self.read_skill_metadata_file(source_dir / "instructions.md", skill_name)
+
+    def resolve_skills_sh_path(self, path: Path) -> Path:
+        if path.is_absolute():
+            return path
+        return self.root / path
+
+    def skills_from_group(self, group: str, skills_sh: Path) -> tuple[list[str], str, str]:
+        manifest_path = self.resolve_skills_sh_path(skills_sh)
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except FileNotFoundError as exc:
+            raise SkillctlError(f"skills.sh manifest not found: {manifest_path}") from exc
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SkillctlError(f"cannot read {manifest_path}: {exc}") from exc
+        if not isinstance(manifest, dict):
+            raise SkillctlError(f"{manifest_path}: expected a JSON object")
+        groupings = manifest.get("groupings", [])
+        if not isinstance(groupings, list):
+            raise SkillctlError(f"{manifest_path}: groupings must be an array")
+
+        matches = [
+            item
+            for item in groupings
+            if isinstance(item, dict) and item.get("title") == group
+        ]
+        if not matches:
+            folded = group.casefold()
+            matches = [
+                item
+                for item in groupings
+                if isinstance(item, dict)
+                and isinstance(item.get("title"), str)
+                and item["title"].casefold() == folded
+            ]
+        if not matches:
+            raise SkillctlError(f"{manifest_path}: grouping not found: {group!r}")
+        if len(matches) > 1:
+            raise SkillctlError(f"{manifest_path}: grouping title is ambiguous: {group!r}")
+
+        matched = matches[0]
+        title = matched.get("title")
+        description = matched.get("description", "")
+        skills = matched.get("skills")
+        if not isinstance(title, str) or not title:
+            raise SkillctlError(f"{manifest_path}: grouping {group!r} title must be a string")
+        if not isinstance(description, str):
+            raise SkillctlError(f"{manifest_path}: grouping {title!r} description must be a string")
+        if (
+            not isinstance(skills, list)
+            or not skills
+            or not all(isinstance(item, str) and item for item in skills)
+        ):
+            raise SkillctlError(f"{manifest_path}: grouping {title!r} skills must be a non-empty string array")
+        return skills, title, description
 
     def validate_source(self, name: str, source: Any) -> list[str]:
         errors: list[str] = []
@@ -270,15 +477,44 @@ class SkillManager:
         self.save_registry()
 
     def sync(self, names: list[str]) -> None:
-        selected = names or sorted(self.sources)
-        for name in selected:
+        selected = names or sorted(set(self.sources) | set(self.routers))
+        selected_sources = [name for name in selected if name in self.sources]
+        selected_routers = [name for name in selected if name in self.routers]
+        unknown = sorted(set(selected) - set(selected_sources) - set(selected_routers))
+        if unknown:
+            raise SkillctlError(f"skill or router not registered: {', '.join(unknown)}")
+        for name in selected_sources:
             source = self.sources.get(name)
-            if source is None:
-                raise SkillctlError(f"external skill not registered: {name}")
             errors = self.validate_source(name, source)
             if errors:
                 raise SkillctlError("\n".join(errors))
             self.sync_one(name, source)
+        for name in selected_routers:
+            self.sync_router(name)
+        self.write_skills_sh()
+
+    def sync_router(self, name: str) -> None:
+        self.router(name, [], None, None, Path("skills.sh.json"), None, True, True)
+
+    def write_skills_sh(self) -> None:
+        groupings = []
+        for name, router in sorted(self.routers.items()):
+            errors = self.validate_router_source(name, router)
+            if errors:
+                raise SkillctlError("\n".join(errors))
+            groupings.append(
+                {
+                    "title": router.get("title") or _title_from_name(name),
+                    "description": router.get("description", ""),
+                    "skills": [_name_from_absorb(spec) for spec in router["absorbs"]],
+                }
+            )
+        manifest = {
+            "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
+            "notGrouped": "bottom",
+            "groupings": groupings,
+        }
+        (self.root / "skills.sh.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
     def _sync_glob(self, label: str, source: dict[str, Any]) -> None:
         """Sync a glob source entry, installing/updating/removing matched skill dirs."""
@@ -352,7 +588,133 @@ class SkillManager:
         else:
             self._sync_single(name, source)
 
+    def router(
+        self,
+        name: str,
+        skill_names: list[str],
+        source_group: str | None,
+        group: str | None,
+        skills_sh: Path,
+        description: str | None,
+        overwrite: bool,
+        absorb: bool,
+    ) -> None:
+        self.validate_name(name)
+        selected = set(skill_names)
+        group_title = ""
+        group_description = ""
+        absorb_specs: list[str] = []
+        registered_router = self.routers.get(name)
+        if registered_router and not (skill_names or source_group or group):
+            errors = self.validate_router_source(name, registered_router)
+            if errors:
+                raise SkillctlError("\n".join(errors))
+            group_title = registered_router.get("title", "")
+            group_description = registered_router.get("description", "")
+            absorb_specs = list(registered_router["absorbs"])
+            selected.update(_name_from_absorb(spec) for spec in absorb_specs)
+        if group:
+            grouped_skills, group_title, group_description = self.skills_from_group(group, skills_sh)
+            selected.update(grouped_skills)
+        if source_group:
+            selected.update(self._glob_owned_skills(source_group))
+        if not selected:
+            hint = " from selected groups" if source_group or group else ""
+            raise SkillctlError(f"{name}: no skills selected{hint}")
+
+        ordered = sorted(selected)
+        with tempfile.TemporaryDirectory(prefix="skillctl-router-") as temporary_string:
+            temporary_root = Path(temporary_string)
+            source_dirs: dict[str, Path] = {}
+            if absorb_specs:
+                source_dirs.update(self.resolve_absorb_sources(absorb_specs, temporary_root / "absorbs"))
+            for skill_name in ordered:
+                self.validate_name(skill_name)
+                if skill_name not in source_dirs:
+                    source_dirs[skill_name] = self.router_source_dir(name, skill_name)
+
+            target = self.target(name)
+            if target.exists() or target.is_symlink():
+                if not overwrite:
+                    raise SkillctlError(f"refusing to overwrite existing skill: {target}")
+
+            metadata = [
+                (skill_name, self.router_source_metadata(source_dirs[skill_name], skill_name))
+                for skill_name in ordered
+            ]
+            router_title = group_title or _title_from_name(name)
+            if description:
+                router_description = description
+            elif group_description:
+                router_description = f"Route {group_title} requests. {group_description}"
+            else:
+                router_description = (
+                    f"Route requests across the {router_title} skill bundle. Use when a user asks "
+                    "for help covered by its bundled reference skills and the exact workflow is unclear."
+                )
+
+            routing_rows = []
+            for skill_name, data in metadata:
+                intent = data["description"] or f"Use the {data['name']} workflow."
+                routing_rows.append(f"| {intent} | `references/{skill_name}/instructions.md` |")
+
+            source_notes = []
+            if registered_router and not (skill_names or source_group or group):
+                source_notes.append(f"Generated from skills.toml router `{name}`.")
+            elif group_title:
+                source_notes.append(f"Generated from skills.sh.json grouping `{group_title}`.")
+            if source_group:
+                source_notes.append(f"Generated from source group `{source_group}`.")
+            source_note = "\n".join(source_notes)
+            if source_note:
+                source_note += "\n"
+            skill_body = render_template(
+                ROUTER_TEMPLATE,
+                {
+                    "NAME_JSON": json.dumps(name),
+                    "DESCRIPTION_JSON": json.dumps(router_description),
+                    "TITLE": router_title,
+                    "SOURCE_NOTE": source_note,
+                    "ROUTING_ROWS": "\n".join(routing_rows),
+                },
+            )
+
+            staged = temporary_root / name
+            staged.mkdir()
+            references_dir = staged / "references"
+            references_dir.mkdir()
+            for skill_name in ordered:
+                shutil.copytree(
+                    source_dirs[skill_name],
+                    references_dir / skill_name,
+                    ignore=shutil.ignore_patterns(".git", GLOB_SOURCE_MARKER),
+                )
+                bundled_skill_file = references_dir / skill_name / "SKILL.md"
+                if bundled_skill_file.exists():
+                    bundled_skill_file.rename(references_dir / skill_name / "instructions.md")
+            (staged / "SKILL.md").write_text(skill_body)
+
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(staged, target)
+        if absorb:
+            self.absorb_router_sources(name, ordered)
+        print(f"created router {name}: {len(ordered)} skills")
+
+    def absorb_router_sources(self, router_name: str, skill_names: list[str]) -> None:
+        for skill_name in skill_names:
+            if skill_name == router_name:
+                continue
+            target = self.target(skill_name)
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.exists():
+                shutil.rmtree(target)
+
     def list(self) -> None:
+        absorbed_names = self.absorbed_skill_names()
         # Determine which skill dirs are glob-owned
         glob_owned: set[str] = set()
         for label, source in self.sources.items():
@@ -360,11 +722,19 @@ class SkillManager:
                 for skill_name in self._glob_owned_skills(label):
                     glob_owned.add(skill_name)
 
-        names = set(self.sources)
+        names = set(self.sources) | set(self.routers)
         if self.skills_dir.exists():
             names.update(path.name for path in self.skills_dir.iterdir() if not path.name.startswith("."))
 
         for name in sorted(names):
+            if name in self.routers:
+                router = self.routers[name]
+                count = len(router.get("absorbs", [])) if isinstance(router, dict) else 0
+                detail = router.get("title", name) if isinstance(router, dict) else name
+                if not self.target(name).exists():
+                    detail += " (missing; run sync)"
+                print(f"{name:<24} router    {detail} ({count} skills)")
+                continue
             source = self.sources.get(name)
             # Glob source registry entries
             if source is not None and _is_glob(source.get("path", "")):
@@ -381,6 +751,10 @@ class SkillManager:
             # Glob-owned skill dirs: skip (don't print as custom)
             if name in glob_owned:
                 continue
+            if name in absorbed_names:
+                detail = source.get("repo", "<invalid>") if source else "absorbed"
+                print(f"{name:<24} absorbed  {detail}")
+                continue
             if source is None:
                 print(f"{name:<24} custom")
                 continue
@@ -393,10 +767,23 @@ class SkillManager:
                 detail += " (missing; run sync)"
             print(f"{name:<24} external  {detail}")
 
+    def absorbed_skill_names(self) -> set[str]:
+        absorbed: set[str] = set()
+        for router in self.routers.values():
+            if not isinstance(router, dict):
+                continue
+            absorbs = router.get("absorbs", [])
+            if isinstance(absorbs, list):
+                for spec in absorbs:
+                    if isinstance(spec, str) and spec:
+                        absorbed.add(_name_from_absorb(spec))
+        return absorbed
+
     def check(self) -> None:
         errors: list[str] = []
         if not self.registry_path.exists():
             errors.append("skills.toml is missing")
+        absorbed_names = self.absorbed_skill_names()
 
         # Determine which skill dirs are glob-owned
         glob_owned: set[str] = set()
@@ -409,6 +796,8 @@ class SkillManager:
 
         for name, source in sorted(self.sources.items()):
             errors.extend(self.validate_source(name, source))
+            if name in absorbed_names:
+                continue
             if _is_glob(source.get("path", "")):
                 # For glob sources: require at least one owned skill
                 if not self._glob_owned_skills(name):
@@ -419,6 +808,22 @@ class SkillManager:
                     errors.append(f"{name}: skills/{name} is missing; run skillctl sync {name}")
                 elif target.is_symlink():
                     errors.append(f"{name}: external snapshot must not be a symlink")
+        for name, router in sorted(self.routers.items()):
+            errors.extend(self.validate_router_source(name, router))
+            target = self.target(name)
+            if not target.exists():
+                errors.append(f"{name}: router is missing; run skillctl sync {name}")
+                continue
+            if not (target / "SKILL.md").is_file():
+                errors.append(f"{name}: router SKILL.md is missing")
+            if isinstance(router, dict) and isinstance(router.get("absorbs"), list):
+                for spec in router["absorbs"]:
+                    if not isinstance(spec, str) or not spec:
+                        continue
+                    skill_name = _name_from_absorb(spec)
+                    reference = target / "references" / skill_name / "instructions.md"
+                    if not reference.is_file():
+                        errors.append(f"{name}: router reference missing: references/{skill_name}/instructions.md")
 
         if self.skills_dir.exists():
             for target in sorted(self.skills_dir.iterdir()):
@@ -426,6 +831,8 @@ class SkillManager:
                     continue
                 # Skip glob-owned dirs in the SKILL.md missing sweep
                 if target.name in glob_owned:
+                    continue
+                if target.name in absorbed_names:
                     continue
                 if not (target / "SKILL.md").is_file():
                     errors.append(f"{target.name}: SKILL.md is missing")
@@ -435,12 +842,14 @@ class SkillManager:
 
         custom_count = 0
         glob_skill_count = 0
+        router_count = len(self.routers)
         if self.skills_dir.exists():
             custom_count = sum(
                 1
                 for target in self.skills_dir.iterdir()
                 if not target.name.startswith(".")
                 and target.name not in self.sources
+                and target.name not in self.routers
                 and target.name not in glob_owned
             )
             glob_skill_count = len(glob_owned)
@@ -451,10 +860,11 @@ class SkillManager:
         glob_source_count = len(glob_labels)
 
         if glob_source_count == 0:
-            print(f"ok: {external_count} external skills, {custom_count} custom skills")
+            print(f"ok: {external_count} external skills, {router_count} routers, {custom_count} custom skills")
         else:
             print(
                 f"ok: {external_count} external skills, "
+                f"{router_count} routers, "
                 f"{glob_source_count} glob sources ({glob_skill_count} skills), "
                 f"{custom_count} custom skills"
             )
@@ -467,6 +877,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser("list", help="list external and custom skills")
     commands.add_parser("check", help="validate skills.toml and the skills tree")
+    commands.add_parser("skills-sh", help="generate skills.sh.json from skills.toml routers")
 
     sync = commands.add_parser("sync", help="refresh registered external skill snapshots")
     sync.add_argument("names", nargs="*")
@@ -477,6 +888,16 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("path", nargs="?", help="optional skill path inside the repo")
     add.add_argument("--ref", default="main")
     add.add_argument("--file", action="append", default=[])
+
+    router = commands.add_parser("router", help="create a portable router skill")
+    router.add_argument("name", help="new router skill name")
+    router.add_argument("skills", nargs="*", help="installed skill names to bundle")
+    router.add_argument("--group", help="include skills from a skills.sh.json grouping title")
+    router.add_argument("--skills-sh", type=Path, default=Path("skills.sh.json"), help="skills.sh manifest path, relative to --root unless absolute")
+    router.add_argument("--source-group", help="include skills owned by this glob source label")
+    router.add_argument("--description", help="frontmatter description for the router skill")
+    router.add_argument("--overwrite", action="store_true")
+    router.add_argument("--absorb", action="store_true", help="remove selected top-level skill dirs after bundling them into the router")
     return parser
 
 
@@ -488,10 +909,23 @@ def main() -> int:
             manager.list()
         elif args.command == "check":
             manager.check()
+        elif args.command == "skills-sh":
+            manager.write_skills_sh()
         elif args.command == "sync":
             manager.sync(args.names)
         elif args.command == "add":
             manager.add(args.source, args.repo, args.ref, args.path, args.file)
+        elif args.command == "router":
+            manager.router(
+                args.name,
+                args.skills,
+                args.source_group,
+                args.group,
+                args.skills_sh,
+                args.description,
+                args.overwrite,
+                args.absorb,
+            )
     except SkillctlError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -1,5 +1,34 @@
 # Toolbox Changelog
 
+## 2026-06-18
+
+### Skill router generation
+- Added `bin/skillctl router` to generate a portable router skill from installed
+  skills by explicit skill names, `skills.sh.json` group titles, or glob
+  source-group labels.
+- Added `skills.toml` router tables with `absorbs = ["repo:path"]` entries as
+  the authoritative source for bundled skill provenance.
+- Added generated root `skills.sh.json` output using the existing Skills.sh
+  grouping convention.
+- Added `templates/skillctl/router.SKILL.md`, rendered with stdlib
+  `string.Template`, so router wording lives outside the Python CLI.
+- Added `just skills-router` and README examples for explicit, group-based, and
+  source-group router generation.
+- Made `skillctl sync` sync standalone sources first, then materialize all
+  routers and absorb their component skills from the active top-level skill
+  tree by default.
+- Changed bundled router references from nested `SKILL.md` files to
+  `instructions.md`, preventing recursive skill scanners from showing duplicate
+  skills.
+- Added `skills/minimalist-entrepreneur`, generated from the
+  `Minimalist Entrepreneur` group with ten absorbed reference skills.
+- Added absorbed `cloudflare` and `agent-workflows` routers. `zoom-out` is kept
+  via a local vendored copy from historical upstream commit
+  `801a01cc7d265e06dd9dbcef5a4c471add05a0b3`.
+- Added regression coverage for router generation, copied references, source
+  marker exclusion, explicit skill selection, `skills.sh.json` groups, and
+  overwrite/absorb protection.
+
 ## 2026-06-15
 
 ### Serializd review fixes

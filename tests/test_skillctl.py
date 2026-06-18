@@ -194,14 +194,14 @@ class SkillctlTestCase(unittest.TestCase):
 
         result = self.run_command("check")
 
-        self.assertIn("0 external skills, 1 custom skills", result.stdout)
+        self.assertIn("0 external skills, 0 routers, 1 custom skills", result.stdout)
 
     def test_check_accepts_empty_tree(self) -> None:
         (self.root / "skills.toml").write_text("# no skills yet\n")
 
         result = self.run_command("check")
 
-        self.assertIn("0 external skills, 0 custom skills", result.stdout)
+        self.assertIn("0 external skills, 0 routers, 0 custom skills", result.stdout)
 
     def test_add_refuses_to_overwrite_existing_custom_skill(self) -> None:
         repo = self.make_repo({"SKILL.md": "# Upstream\n"})
@@ -354,6 +354,222 @@ class SkillctlTestCase(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("glob sources", result.stdout)
+
+    def test_router_from_source_group_copies_reference_skills(self) -> None:
+        alpha = self.root / "skills" / "alpha"
+        beta = self.root / "skills" / "beta"
+        alpha.mkdir(parents=True)
+        beta.mkdir(parents=True)
+        (alpha / "SKILL.md").write_text(
+            "---\n"
+            "name: alpha\n"
+            "description: Handle alpha workflows.\n"
+            "---\n"
+            "\n"
+            "# Alpha\n"
+        )
+        (alpha / "reference.md").write_text("alpha reference\n")
+        (alpha / ".skillctl-source").write_text("group-one")
+        (beta / "SKILL.md").write_text(
+            "---\n"
+            "name: beta\n"
+            "description: Handle beta workflows.\n"
+            "---\n"
+            "\n"
+            "# Beta\n"
+        )
+        (beta / ".skillctl-source").write_text("group-one")
+
+        self.run_command(
+            "router",
+            "bundle-router",
+            "--source-group",
+            "group-one",
+            "--description",
+            "Route bundle requests.",
+        )
+
+        router = self.root / "skills" / "bundle-router"
+        skill_text = (router / "SKILL.md").read_text()
+        self.assertIn('name: "bundle-router"', skill_text)
+        self.assertIn('description: "Route bundle requests."', skill_text)
+        self.assertIn("Generated from source group `group-one`.", skill_text)
+        self.assertIn("| Handle alpha workflows. | `references/alpha/instructions.md` |", skill_text)
+        self.assertIn("| Handle beta workflows. | `references/beta/instructions.md` |", skill_text)
+        self.assertEqual(
+            (router / "references" / "alpha" / "reference.md").read_text(),
+            "alpha reference\n",
+        )
+        self.assertTrue((router / "references" / "alpha" / "instructions.md").exists())
+        self.assertFalse((router / "references" / "alpha" / "SKILL.md").exists())
+        self.assertFalse((router / "references" / "alpha" / ".skillctl-source").exists())
+
+    def test_router_from_skills_sh_group_copies_reference_skills(self) -> None:
+        alpha = self.root / "skills" / "alpha"
+        beta = self.root / "skills" / "beta"
+        alpha.mkdir(parents=True)
+        beta.mkdir(parents=True)
+        (alpha / "SKILL.md").write_text(
+            "---\n"
+            "name: alpha\n"
+            "description: Handle alpha workflows.\n"
+            "---\n"
+            "\n"
+            "# Alpha\n"
+        )
+        (beta / "SKILL.md").write_text(
+            "---\n"
+            "name: beta\n"
+            "description: Handle beta workflows.\n"
+            "---\n"
+            "\n"
+            "# Beta\n"
+        )
+        (self.root / "skills.sh.json").write_text(
+            "{\n"
+            '  "$schema": "https://skills.sh/schemas/skills.sh.schema.json",\n'
+            '  "notGrouped": "bottom",\n'
+            '  "groupings": [\n'
+            "    {\n"
+            '      "title": "Bundle Group",\n'
+            '      "description": "Skills for grouped routing.",\n'
+            '      "skills": ["alpha", "beta"]\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+        )
+
+        self.run_command("router", "bundle-router", "--group", "Bundle Group")
+
+        router = self.root / "skills" / "bundle-router"
+        skill_text = (router / "SKILL.md").read_text()
+        self.assertIn('description: "Route Bundle Group requests. Skills for grouped routing."', skill_text)
+        self.assertIn("Generated from skills.sh.json grouping `Bundle Group`.", skill_text)
+        self.assertIn("| Handle alpha workflows. | `references/alpha/instructions.md` |", skill_text)
+        self.assertIn("| Handle beta workflows. | `references/beta/instructions.md` |", skill_text)
+
+    def test_router_absorb_removes_top_level_sources_and_preserves_glob(self) -> None:
+        repo = self.make_repo(
+            {
+                "skills/alpha/SKILL.md": "# Alpha\n",
+                "skills/beta/SKILL.md": "# Beta\n",
+            }
+        )
+        self.run_command("add", "glob-all", str(repo), "skills/*")
+        (self.root / "skills.sh.json").write_text(
+            '{"groupings": [{"title": "Bundle Group", "skills": ["alpha", "beta"]}]}\n'
+        )
+
+        self.run_command("router", "bundle-router", "--group", "Bundle Group", "--absorb")
+
+        router = self.root / "skills" / "bundle-router"
+        self.assertTrue((router / "references" / "alpha" / "instructions.md").exists())
+        self.assertFalse((self.root / "skills" / "alpha").exists())
+        self.assertFalse((self.root / "skills" / "beta").exists())
+        self.assertIn("[skills.glob-all]", (self.root / "skills.toml").read_text())
+
+    def test_sync_registered_router_absorbs_by_default_and_generates_skills_sh(self) -> None:
+        repo = self.make_repo(
+            {
+                "skills/alpha/SKILL.md": "# Alpha\n",
+                "skills/beta/SKILL.md": "# Beta\n",
+            }
+        )
+        (self.root / "skills.toml").write_text(
+            '[routers.bundle-router]\n'
+            'title = "Bundle Group"\n'
+            'description = "Skills for grouped routing."\n'
+            f'absorbs = ["{repo}:skills/alpha", "{repo}:skills/beta"]\n'
+        )
+
+        self.run_command("sync")
+
+        router = self.root / "skills" / "bundle-router"
+        self.assertTrue((router / "SKILL.md").exists())
+        self.assertTrue((router / "references" / "alpha" / "instructions.md").exists())
+        self.assertTrue((router / "references" / "beta" / "instructions.md").exists())
+        self.assertFalse((self.root / "skills" / "alpha").exists())
+        self.assertFalse((self.root / "skills" / "beta").exists())
+        generated = (self.root / "skills.sh.json").read_text()
+        self.assertIn('"title": "Bundle Group"', generated)
+        self.assertIn('"alpha"', generated)
+        self.assertIn('"beta"', generated)
+
+    def test_router_can_regenerate_from_absorbed_references(self) -> None:
+        alpha = self.root / "skills" / "alpha"
+        alpha.mkdir(parents=True)
+        (alpha / "SKILL.md").write_text(
+            "---\n"
+            "name: alpha\n"
+            "description: Handle alpha workflows.\n"
+            "---\n"
+            "\n"
+            "# Alpha\n"
+        )
+        (self.root / "skills.sh.json").write_text(
+            '{"groupings": [{"title": "Bundle Group", "skills": ["alpha"]}]}\n'
+        )
+        self.run_command("router", "bundle-router", "--group", "Bundle Group", "--absorb")
+
+        self.run_command(
+            "router",
+            "bundle-router",
+            "--group",
+            "Bundle Group",
+            "--overwrite",
+            "--absorb",
+            "--description",
+            "Updated description.",
+        )
+
+        router = self.root / "skills" / "bundle-router"
+        skill_text = (router / "SKILL.md").read_text()
+        self.assertIn('description: "Updated description."', skill_text)
+        self.assertIn("| Handle alpha workflows. | `references/alpha/instructions.md` |", skill_text)
+        self.assertFalse((self.root / "skills" / "alpha").exists())
+
+    def test_router_fails_when_skills_sh_group_is_missing(self) -> None:
+        (self.root / "skills.sh.json").write_text(
+            '{"groupings": [{"title": "Other", "skills": ["alpha"]}]}\n'
+        )
+
+        result = self.run_command(
+            "router",
+            "bundle-router",
+            "--group",
+            "Missing",
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("grouping not found", result.stderr)
+
+    def test_router_accepts_explicit_skill_names(self) -> None:
+        alpha = self.root / "skills" / "alpha"
+        alpha.mkdir(parents=True)
+        (alpha / "SKILL.md").write_text("# Alpha\n")
+
+        self.run_command("router", "single-router", "alpha")
+
+        router = self.root / "skills" / "single-router"
+        skill_text = (router / "SKILL.md").read_text()
+        self.assertIn("| Use the alpha workflow. | `references/alpha/instructions.md` |", skill_text)
+        self.assertTrue((router / "references" / "alpha" / "instructions.md").exists())
+        self.assertFalse((router / "references" / "alpha" / "SKILL.md").exists())
+
+    def test_router_refuses_to_overwrite_without_flag(self) -> None:
+        alpha = self.root / "skills" / "alpha"
+        router = self.root / "skills" / "bundle-router"
+        alpha.mkdir(parents=True)
+        router.mkdir(parents=True)
+        (alpha / "SKILL.md").write_text("# Alpha\n")
+        (router / "SKILL.md").write_text("# Existing\n")
+
+        result = self.run_command("router", "bundle-router", "alpha", check=False)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing to overwrite", result.stderr)
+        self.assertEqual((router / "SKILL.md").read_text(), "# Existing\n")
 
 
 if __name__ == "__main__":

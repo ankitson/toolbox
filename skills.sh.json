@@ -1,0 +1,46 @@
+{
+  "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
+  "notGrouped": "bottom",
+  "groupings": [
+    {
+      "title": "Agent Workflows",
+      "description": "Skills for structured agent collaboration workflows: planning grill sessions, documentation-backed grilling, issue triage, and zooming out for broader context.",
+      "skills": [
+        "grill-me",
+        "grill-with-docs",
+        "triage",
+        "zoom-out"
+      ]
+    },
+    {
+      "title": "Cloudflare Platform",
+      "description": "Skills for Cloudflare development across Workers, Agents SDK, Durable Objects, Wrangler, web performance, sandboxed execution, email service, and Workers best practices.",
+      "skills": [
+        "cloudflare",
+        "agents-sdk",
+        "durable-objects",
+        "sandbox-sdk",
+        "wrangler",
+        "web-perf",
+        "cloudflare-email-service",
+        "workers-best-practices"
+      ]
+    },
+    {
+      "title": "Minimalist Entrepreneur",
+      "description": "Skills for Sahil Lavingia-style minimalist business workflows: finding a community, validating ideas, processizing, building MVPs, pricing, selling to first customers, marketing, growing sustainably, reviewing decisions, and defining company values.",
+      "skills": [
+        "find-community",
+        "validate-idea",
+        "processize",
+        "mvp",
+        "pricing",
+        "first-customers",
+        "marketing-plan",
+        "grow-sustainably",
+        "minimalist-review",
+        "company-values"
+      ]
+    }
+  ]
+}
