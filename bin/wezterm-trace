@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""
+Capture WezTerm/SSHMUX diagnostics for transient focus/title/pane loops.
+
+The output is a timestamped directory under ~/wezterm_traces plus a tarball.
+All command output is passed through a best-effort redactor before it is written.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tarfile
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+SECRET_PATTERNS = [
+    re.compile(r"(?i)(authorization:\s*bearer\s+)[^\s'\"]+"),
+    re.compile(r"(?i)(authorization:\s*basic\s+)[^\s'\"]+"),
+    re.compile(r"(?i)(api[_-]?key\s*[=:]\s*)[^\s'\",;]+"),
+    re.compile(r"(?i)(token\s*[=:]\s*)[^\s'\",;]+"),
+    re.compile(r"(?i)(secret\s*[=:]\s*)[^\s'\",;]+"),
+    re.compile(r"(?i)(password\s*[=:]\s*)[^\s'\",;]+"),
+    re.compile(r"(?i)(passwd\s*[=:]\s*)[^\s'\",;]+"),
+    re.compile(r"(?i)(OP_SESSION_[A-Z0-9_]+=)[^\s'\";]+"),
+    re.compile(r"(?i)(AWS_SECRET_ACCESS_KEY=)[^\s'\";]+"),
+    re.compile(r"(?i)(AWS_SESSION_TOKEN=)[^\s'\";]+"),
+    re.compile(r"(?i)(GITHUB_TOKEN=)[^\s'\";]+"),
+    re.compile(r"(?i)(OPENAI_API_KEY=)[^\s'\";]+"),
+    re.compile(r"(?i)(ANTHROPIC_API_KEY=)[^\s'\";]+"),
+    re.compile(r"(?i)(CF_API_TOKEN=)[^\s'\";]+"),
+    re.compile(r"(?i)(CLOUDFLARE_API_TOKEN=)[^\s'\";]+"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{12,}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+]
+
+SENSITIVE_ENV_NAME = re.compile(
+    r"(?i)(TOKEN|SECRET|PASSWORD|PASSWD|KEY|CREDENTIAL|COOKIE|SESSION|AUTH|BEARER)"
+)
+
+
+@dataclass
+class CmdResult:
+    args: list[str]
+    returncode: int | None
+    stdout: str
+    stderr: str
+    timed_out: bool
+    duration_ms: int
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def local_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def redact_text(text: str) -> str:
+    redacted = text
+    for pattern in SECRET_PATTERNS:
+        redacted = pattern.sub(lambda m: (m.group(1) if m.groups() else "") + "<REDACTED>", redacted)
+    return redacted
+
+
+def redact_obj(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if SENSITIVE_ENV_NAME.search(str(key)):
+                out[key] = "<REDACTED>"
+            else:
+                out[key] = redact_obj(item)
+        return out
+    if isinstance(value, list):
+        return [redact_obj(item) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
+    return value
+
+
+def safe_name(name: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip())
+    return name[:160] or "unnamed"
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(redact_text(text), encoding="utf-8", errors="replace")
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(redact_obj(data), indent=2, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def run_cmd(
+    args: list[str],
+    timeout: float,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> CmdResult:
+    start = time.time()
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+        return CmdResult(args, proc.returncode, proc.stdout, proc.stderr, False, int((time.time() - start) * 1000))
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        return CmdResult(args, None, stdout, stderr + "\n<TIMED OUT>", True, int((time.time() - start) * 1000))
+    except Exception as exc:
+        return CmdResult(args, None, "", f"{type(exc).__name__}: {exc}", False, int((time.time() - start) * 1000))
+
+
+def capture_cmd(out_dir: Path, label: str, args: list[str], timeout: float = 10, cwd: Path | None = None) -> CmdResult:
+    result = run_cmd(args, timeout=timeout, cwd=cwd)
+    base = out_dir / "commands" / safe_name(label)
+    write_text(base.with_suffix(".stdout.txt"), result.stdout)
+    write_text(base.with_suffix(".stderr.txt"), result.stderr)
+    write_json(
+        base.with_suffix(".meta.json"),
+        {
+            "label": label,
+            "args": result.args,
+            "cwd": str(cwd) if cwd else None,
+            "returncode": result.returncode,
+            "timed_out": result.timed_out,
+            "duration_ms": result.duration_ms,
+            "captured_at": utc_now(),
+        },
+    )
+    return result
+
+
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def read_json_cmd(args: list[str], timeout: float = 5) -> tuple[Any | None, str | None]:
+    result = run_cmd(args, timeout=timeout)
+    if result.returncode != 0:
+        return None, result.stderr or result.stdout or f"returncode={result.returncode}"
+    try:
+        return json.loads(result.stdout), None
+    except json.JSONDecodeError as exc:
+        return None, f"JSONDecodeError: {exc}\n{result.stdout[:1000]}"
+
+
+def proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+
+
+def interesting_pids() -> list[int]:
+    result = run_cmd(["ps", "-eo", "pid,ppid,pgid,sid,stat,pcpu,pmem,etime,comm,args"], timeout=5)
+    pids: set[int] = set()
+    for line in result.stdout.splitlines()[1:]:
+        fields = line.split(None, 10)
+        if len(fields) < 10:
+            continue
+        haystack = line.lower()
+        if any(term in haystack for term in ("wezterm", "ssh", "tmux", "mux", "bash", "zsh", "fish")):
+            try:
+                pids.add(int(fields[0]))
+                pids.add(int(fields[1]))
+            except ValueError:
+                pass
+    return sorted(pid for pid in pids if pid > 1)
+
+
+def capture_proc_details(out_dir: Path, pids: list[int], include_fd: bool) -> None:
+    proc_dir = out_dir / "proc"
+    for pid in pids:
+        pid_dir = proc_dir / str(pid)
+        pid_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("status", "stat", "sched", "limits", "io", "wchan", "stack"):
+            path = Path(f"/proc/{pid}/{name}")
+            try:
+                write_text(pid_dir / f"{name}.txt", path.read_text(encoding="utf-8", errors="replace"))
+            except OSError as exc:
+                write_text(pid_dir / f"{name}.error.txt", f"{type(exc).__name__}: {exc}")
+        write_text(pid_dir / "cmdline.txt", proc_cmdline(pid))
+        if include_fd:
+            fd_rows = []
+            fd_dir = Path(f"/proc/{pid}/fd")
+            try:
+                for fd in sorted(fd_dir.iterdir(), key=lambda p: p.name):
+                    try:
+                        target = os.readlink(fd)
+                    except OSError as exc:
+                        target = f"<readlink failed: {exc}>"
+                    fd_rows.append({"fd": fd.name, "target": target})
+            except OSError as exc:
+                fd_rows.append({"error": f"{type(exc).__name__}: {exc}"})
+            write_json(pid_dir / "fd.json", fd_rows)
+
+
+def capture_config_files(out_dir: Path) -> None:
+    candidates = [
+        Path.home() / ".wezterm.lua",
+        Path.home() / ".tmux.conf",
+        Path.home() / ".bashrc",
+        Path.home() / ".bash_profile",
+        Path.home() / ".zshrc",
+        Path.home() / ".ssh" / "config",
+        Path.home() / "hroot/projects/devdocker/dotfiles/dot_wezterm.lua.tmpl",
+    ]
+    for path in candidates:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            rel = safe_name(str(path).removeprefix(str(Path.home()) + "/").replace("/", "__"))
+            write_text(out_dir / "config" / rel, path.read_text(encoding="utf-8", errors="replace"))
+        except OSError as exc:
+            write_text(out_dir / "config" / f"{safe_name(str(path))}.error.txt", f"{type(exc).__name__}: {exc}")
+
+
+def capture_wezterm_snapshot(out_dir: Path, prefix: str, pane_start_line: int, include_escapes: bool) -> dict[str, Any]:
+    snap_dir = out_dir / "wezterm" / prefix
+    snap_dir.mkdir(parents=True, exist_ok=True)
+
+    panes, panes_err = read_json_cmd(["wezterm", "cli", "list", "--format", "json"])
+    clients, clients_err = read_json_cmd(["wezterm", "cli", "list-clients", "--format", "json"])
+    write_json(snap_dir / "panes.json", panes if panes is not None else {"error": panes_err})
+    write_json(snap_dir / "clients.json", clients if clients is not None else {"error": clients_err})
+
+    pane_text_errors: dict[str, str] = {}
+    if isinstance(panes, list):
+        for pane in panes:
+            pane_id = str(pane.get("pane_id"))
+            if not pane_id or pane_id == "None":
+                continue
+            base_args = ["wezterm", "cli", "get-text", "--pane-id", pane_id, f"--start-line={pane_start_line}"]
+            plain = run_cmd(base_args, timeout=8)
+            title = safe_name(f"tab{pane.get('tab_id')}_pane{pane_id}_{pane.get('title', '')}")
+            write_text(snap_dir / "pane_text" / f"{title}.txt", plain.stdout)
+            if plain.stderr or plain.returncode not in (0, None):
+                pane_text_errors[pane_id] = plain.stderr or f"returncode={plain.returncode}"
+
+            if include_escapes:
+                escaped = run_cmd(base_args + ["--escapes"], timeout=8)
+                write_text(snap_dir / "pane_text_escapes" / f"{title}.txt", escaped.stdout)
+                if escaped.stderr or escaped.returncode not in (0, None):
+                    pane_text_errors[f"{pane_id}:escapes"] = escaped.stderr or f"returncode={escaped.returncode}"
+
+    write_json(snap_dir / "pane_text_errors.json", pane_text_errors)
+    return {"panes": panes, "clients": clients, "pane_errors": pane_text_errors}
+
+
+def parse_ps_relevant() -> list[dict[str, Any]]:
+    result = run_cmd(["ps", "-eo", "pid,ppid,pgid,sid,stat,pcpu,pmem,etime,comm,args"], timeout=5)
+    rows = []
+    for line in result.stdout.splitlines()[1:]:
+        fields = line.split(None, 10)
+        if len(fields) < 11:
+            continue
+        pid, ppid, pgid, sid, stat, pcpu, pmem, etime, comm, args = (
+            fields[0],
+            fields[1],
+            fields[2],
+            fields[3],
+            fields[4],
+            fields[5],
+            fields[6],
+            fields[7],
+            fields[8],
+            fields[10],
+        )
+        haystack = f"{comm} {args}".lower()
+        if any(term in haystack for term in ("wezterm", "ssh", "tmux", "mux", "bash", "zsh", "fish")):
+            rows.append(
+                {
+                    "pid": pid,
+                    "ppid": ppid,
+                    "pgid": pgid,
+                    "sid": sid,
+                    "stat": stat,
+                    "pcpu": pcpu,
+                    "pmem": pmem,
+                    "etime": etime,
+                    "comm": comm,
+                    "args": args,
+                }
+            )
+    return rows
+
+
+def sample_loop(out_dir: Path, duration: float, interval: float) -> None:
+    path = out_dir / "monitor" / "samples.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + duration
+    with path.open("w", encoding="utf-8") as fh:
+        while time.monotonic() < deadline:
+            sample: dict[str, Any] = {"at": utc_now()}
+            panes, panes_err = read_json_cmd(["wezterm", "cli", "list", "--format", "json"], timeout=3)
+            clients, clients_err = read_json_cmd(["wezterm", "cli", "list-clients", "--format", "json"], timeout=3)
+            sample["panes"] = panes if panes is not None else {"error": panes_err}
+            sample["clients"] = clients if clients is not None else {"error": clients_err}
+            sample["processes"] = parse_ps_relevant()
+            fh.write(json.dumps(redact_obj(sample), ensure_ascii=False, sort_keys=True) + "\n")
+            fh.flush()
+            time.sleep(interval)
+
+
+def capture_logs(out_dir: Path, shell_log_bytes: int) -> None:
+    log_dir = out_dir / "logs"
+    uid = os.getuid()
+    candidates: list[Path] = []
+    candidates.extend(Path(f"/run/user/{uid}/wezterm").glob("*") if Path(f"/run/user/{uid}/wezterm").exists() else [])
+    candidates.extend((Path.home() / ".local/share/wezterm").glob("**/*log*") if (Path.home() / ".local/share/wezterm").exists() else [])
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+            if len(data) > 5_000_000:
+                data = data[-5_000_000:]
+            text = data.decode("utf-8", errors="replace")
+            write_text(log_dir / "wezterm" / safe_name(str(path)), text)
+        except OSError as exc:
+            write_text(log_dir / "wezterm" / f"{safe_name(str(path))}.error.txt", f"{type(exc).__name__}: {exc}")
+
+    shell_log_dir = Path.home() / ".local/share/shell-logs"
+    shell_rows = []
+    if shell_log_dir.exists():
+        for path in sorted(shell_log_dir.glob("*"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)[:80]:
+            try:
+                shell_rows.append(
+                    {
+                        "path": str(path),
+                        "size": path.stat().st_size,
+                        "mtime": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+                    }
+                )
+                if shell_log_bytes > 0 and path.is_file() and path.suffix == ".log":
+                    data = path.read_bytes()[-shell_log_bytes:]
+                    write_text(log_dir / "shell-log-tails" / safe_name(path.name), data.decode("utf-8", errors="replace"))
+            except OSError as exc:
+                shell_rows.append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
+    write_json(log_dir / "shell_logs_index.json", shell_rows)
+
+
+def capture_system(out_dir: Path) -> None:
+    commands = {
+        "date": ["date", "--iso-8601=seconds"],
+        "uname": ["uname", "-a"],
+        "uptime": ["uptime"],
+        "free": ["free", "-h"],
+        "df": ["df", "-h"],
+        "ps_full": ["ps", "-eo", "pid,ppid,pgid,sid,stat,pcpu,pmem,etime,tty,comm,args"],
+        "wezterm_version": ["wezterm", "--version"],
+        "wezterm_cli_help": ["wezterm", "cli", "--help"],
+        "env": ["printenv"],
+    }
+    optional = {
+        "pstree": ["pstree", "-aps", str(os.getpid())],
+        "lsof_wezterm": ["lsof", "-c", "wezterm"],
+        "wmctrl": ["wmctrl", "-lp"],
+        "xprop_root": ["xprop", "-root"],
+        "xdpyinfo": ["xdpyinfo"],
+        "loginctl_session_status": ["loginctl", "session-status"],
+    }
+    for label, args in commands.items():
+        capture_cmd(out_dir, f"system_{label}", args, timeout=12)
+    for label, args in optional.items():
+        if command_exists(args[0]):
+            capture_cmd(out_dir, f"system_{label}", args, timeout=12)
+
+
+def capture_sudo(out_dir: Path, pids: list[int], allow_prompt: bool) -> None:
+    if not command_exists("sudo"):
+        write_text(out_dir / "sudo" / "unavailable.txt", "sudo command not found")
+        return
+    test_args = ["sudo", "true"] if allow_prompt else ["sudo", "-n", "true"]
+    test = run_cmd(test_args, timeout=20 if allow_prompt else 3)
+    if test.returncode != 0:
+        write_text(out_dir / "sudo" / "unavailable.txt", test.stderr or "sudo not available")
+        return
+
+    sudo_prefix = ["sudo"]
+    capture_cmd(out_dir, "sudo_dmesg_tail", sudo_prefix + ["dmesg", "--ctime", "--color=never"], timeout=15)
+    if command_exists("journalctl"):
+        capture_cmd(out_dir, "sudo_journal_kernel_recent", sudo_prefix + ["journalctl", "-k", "--since", "-30 min", "--no-pager"], timeout=20)
+        capture_cmd(out_dir, "sudo_journal_wezterm_recent", sudo_prefix + ["journalctl", "--since", "-30 min", "--no-pager", "-g", "wezterm|ssh|mux"], timeout=20)
+    if command_exists("lsof") and pids:
+        capture_cmd(out_dir, "sudo_lsof_relevant_pids", sudo_prefix + ["lsof", "-p", ",".join(map(str, pids))], timeout=20)
+
+
+def capture_perf(out_dir: Path, pids: list[int], seconds: int, use_sudo: bool) -> None:
+    if seconds <= 0:
+        return
+    if not command_exists("perf"):
+        write_text(out_dir / "perf" / "unavailable.txt", "perf command not found")
+        return
+    wez_pids = []
+    for pid in pids:
+        cmdline = proc_cmdline(pid).lower()
+        if "wezterm" in cmdline:
+            wez_pids.append(pid)
+    if not wez_pids:
+        write_text(out_dir / "perf" / "unavailable.txt", "no wezterm pids found")
+        return
+
+    perf_dir = out_dir / "perf"
+    perf_dir.mkdir(parents=True, exist_ok=True)
+    perf_data = perf_dir / "perf.data"
+    prefix = ["sudo"] if use_sudo else []
+    record_args = prefix + [
+        "perf",
+        "record",
+        "-F",
+        "99",
+        "-g",
+        "-p",
+        ",".join(map(str, wez_pids)),
+        "-o",
+        str(perf_data),
+        "--",
+        "sleep",
+        str(seconds),
+    ]
+    result = capture_cmd(out_dir, "perf_record_wezterm", record_args, timeout=seconds + 20)
+    if result.returncode == 0 and perf_data.exists():
+        capture_cmd(out_dir, "perf_report_wezterm", prefix + ["perf", "report", "--stdio", "-i", str(perf_data)], timeout=40)
+
+
+def make_archive(out_dir: Path) -> Path:
+    archive = out_dir.with_suffix(".tar.gz")
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(out_dir, arcname=out_dir.name)
+    return archive
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Capture WezTerm/SSHMUX loop diagnostics.")
+    parser.add_argument("--duration", type=float, default=20.0, help="seconds to sample mux state; default: 20")
+    parser.add_argument("--interval", type=float, default=0.15, help="sampling interval in seconds; default: 0.15")
+    parser.add_argument("--out", type=Path, default=Path.home() / "wezterm_traces", help="trace output root")
+    parser.add_argument("--pane-start-line", type=int, default=-5000, help="scrollback start line for pane text; default: -5000")
+    parser.add_argument("--no-escapes", action="store_true", help="skip escape-preserving pane text capture")
+    parser.add_argument("--shell-log-bytes", type=int, default=0, help="tail bytes per recent shell log; default: 0")
+    parser.add_argument("--sudo", action="store_true", help="prompt for sudo and collect privileged logs")
+    parser.add_argument("--sudo-noninteractive", action="store_true", help="use sudo -n style availability check")
+    parser.add_argument("--perf", action="store_true", help="collect perf record/report for wezterm processes")
+    parser.add_argument("--perf-seconds", type=int, default=10, help="perf recording duration; default: 10")
+    parser.add_argument("--include-proc-fd", action="store_true", help="include /proc/<pid>/fd symlink targets")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    if args.interval <= 0:
+        raise SystemExit("--interval must be positive")
+    if args.duration < 0:
+        raise SystemExit("--duration must be non-negative")
+
+    stamp = local_stamp()
+    out_dir = args.out.expanduser() / f"wezterm-trace-{stamp}"
+    out_dir.mkdir(parents=True, exist_ok=False)
+    os.chmod(out_dir, 0o700)
+
+    interrupted = False
+
+    def handle_sigint(_signum: int, _frame: Any) -> None:
+        nonlocal interrupted
+        interrupted = True
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    write_json(
+        out_dir / "trace_meta.json",
+        {
+            "started_at": utc_now(),
+            "argv": sys.argv,
+            "cwd": os.getcwd(),
+            "user": os.environ.get("USER"),
+            "hostname": run_cmd(["hostname"], timeout=2).stdout.strip(),
+            "pid": os.getpid(),
+            "redaction": "best-effort common secret pattern redaction applied before writing outputs",
+        },
+    )
+
+    print(f"trace dir: {out_dir}")
+    print("capturing initial state...")
+    capture_system(out_dir)
+    capture_config_files(out_dir)
+    capture_logs(out_dir, shell_log_bytes=args.shell_log_bytes)
+    capture_wezterm_snapshot(out_dir, "initial", args.pane_start_line, include_escapes=not args.no_escapes)
+
+    pids = interesting_pids()
+    write_json(out_dir / "proc" / "interesting_pids.json", pids)
+    capture_proc_details(out_dir, pids, include_fd=args.include_proc_fd)
+
+    if args.sudo or args.sudo_noninteractive:
+        print("capturing sudo diagnostics...")
+        capture_sudo(out_dir, pids, allow_prompt=args.sudo and not args.sudo_noninteractive)
+
+    if args.perf:
+        print("capturing perf data...")
+        capture_perf(out_dir, pids, seconds=args.perf_seconds, use_sudo=args.sudo or args.sudo_noninteractive)
+
+    try:
+        if args.duration > 0:
+            print(f"sampling for {args.duration:g}s...")
+            sample_loop(out_dir, duration=args.duration, interval=args.interval)
+    except KeyboardInterrupt:
+        interrupted = True
+        write_text(out_dir / "INTERRUPTED.txt", f"Interrupted at {utc_now()}\n")
+
+    print("capturing final state...")
+    capture_wezterm_snapshot(out_dir, "final", args.pane_start_line, include_escapes=not args.no_escapes)
+    write_json(
+        out_dir / "trace_complete.json",
+        {
+            "completed_at": utc_now(),
+            "interrupted": interrupted,
+            "archive_pending": True,
+        },
+    )
+    archive = make_archive(out_dir)
+    write_json(
+        out_dir / "trace_complete.json",
+        {
+            "completed_at": utc_now(),
+            "interrupted": interrupted,
+            "archive": str(archive),
+        },
+    )
+    print(f"archive: {archive}")
+    return 130 if interrupted else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

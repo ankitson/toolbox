@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Summarize a wezterm-trace monitor/samples.jsonl file."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import tarfile
+import tempfile
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+
+SECRET_PATTERNS = [
+    re.compile(r"(?i)(token\s*[=:]\s*)[^\s'\",;]+"),
+    re.compile(r"(?i)(secret\s*[=:]\s*)[^\s'\",;]+"),
+    re.compile(r"(?i)(password\s*[=:]\s*)[^\s'\",;]+"),
+    re.compile(r"(?i)(authorization:\s*bearer\s+)[^\s'\"]+"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{12,}\b"),
+]
+
+
+def redact(text: str) -> str:
+    out = text
+    for pattern in SECRET_PATTERNS:
+        out = pattern.sub(lambda m: (m.group(1) if m.groups() else "") + "<REDACTED>", out)
+    return out
+
+
+def load_samples(path: Path) -> list[dict[str, Any]]:
+    samples_path = path
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    if path.suffixes[-2:] == [".tar", ".gz"]:
+        temp_dir = tempfile.TemporaryDirectory()
+        with tarfile.open(path, "r:gz") as tar:
+            member = next((m for m in tar.getmembers() if m.name.endswith("/monitor/samples.jsonl")), None)
+            if member is None:
+                raise SystemExit("monitor/samples.jsonl not found in archive")
+            tar.extract(member, temp_dir.name, filter="data")
+            samples_path = Path(temp_dir.name) / member.name
+    elif path.is_dir():
+        samples_path = path / "monitor" / "samples.jsonl"
+
+    rows = []
+    with samples_path.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    if temp_dir:
+        temp_dir.cleanup()
+    return rows
+
+
+def pane_key(pane: dict[str, Any]) -> tuple[Any, Any]:
+    return pane.get("tab_id"), pane.get("pane_id")
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Summarize a wezterm-trace bundle.")
+    parser.add_argument("trace", type=Path, help="trace directory, tar.gz, or monitor/samples.jsonl")
+    parser.add_argument("--top", type=int, default=20, help="number of title changes to show")
+    args = parser.parse_args(argv)
+
+    samples = load_samples(args.trace.expanduser())
+    if not samples:
+        print("No samples found.")
+        return 1
+
+    focus_transitions = []
+    active_transitions = []
+    title_change_counts: Counter[tuple[Any, Any]] = Counter()
+    title_examples: dict[tuple[Any, Any], set[str]] = {}
+
+    last_focus = None
+    last_active = None
+    last_titles: dict[tuple[Any, Any], str] = {}
+
+    for sample in samples:
+        at = sample.get("at")
+        clients = sample.get("clients")
+        panes = sample.get("panes")
+        if isinstance(clients, list):
+            focus = tuple((c.get("hostname"), c.get("pid"), c.get("focused_pane_id"), c.get("workspace")) for c in clients)
+            if last_focus is not None and focus != last_focus:
+                focus_transitions.append((at, last_focus, focus))
+            last_focus = focus
+
+        if isinstance(panes, list):
+            active = tuple((p.get("tab_id"), p.get("pane_id"), p.get("title")) for p in panes if p.get("is_active"))
+            if last_active is not None and active != last_active:
+                active_transitions.append((at, last_active, active))
+            last_active = active
+
+            titles = {pane_key(p): str(p.get("title") or "") for p in panes}
+            for key, title in titles.items():
+                old = last_titles.get(key)
+                if old is not None and old != title:
+                    title_change_counts[key] += 1
+                    title_examples.setdefault(key, set()).update([old, title])
+            last_titles = titles
+
+    print(f"samples: {len(samples)}")
+    print(f"focus transitions: {len(focus_transitions)}")
+    for at, old, new in focus_transitions[: args.top]:
+        print(f"  {at}: {redact(str(old))} -> {redact(str(new))}")
+
+    print(f"active-pane transitions: {len(active_transitions)}")
+    for at, old, new in active_transitions[: args.top]:
+        print(f"  {at}: {redact(str(old))} -> {redact(str(new))}")
+
+    print("title changes:")
+    for key, count in title_change_counts.most_common(args.top):
+        examples = sorted(title_examples.get(key, []))[:4]
+        print(f"  tab={key[0]} pane={key[1]} changes={count} examples={redact(str(examples))}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
