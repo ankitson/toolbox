@@ -12,6 +12,10 @@ path = "skills/{claude-api,skill-creator}"
 repo = "openclaw/agent-skills"
 path = "skills/autoreview"
 
+[skills.job-search]
+repo = "ssh://git@git.home.ankitson.com:1024/ankitson/job-search.git"
+path = "skills/job-search"
+
 [skills.last30days]
 repo = "mvanhorn/last30days-skill"
 path = "skills/last30days"
