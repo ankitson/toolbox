@@ -1,4 +1,4 @@
 interface:
   display_name: "Summarize CLI"
-  short_description: "Summarize URLs, files, stdin, and media with steipete/summarize"
-  default_prompt: "Use the summarize CLI wrapper for quick summaries or cleaned extraction from URLs, files, stdin, YouTube links, podcasts, PDFs, audio, or video."
+  short_description: "Summarize URLs, files, stdin, and media; saves stdout copies under /tmp/summarize"
+  default_prompt: "Use the summarize CLI wrapper for quick summaries or cleaned extraction from URLs, files, stdin, YouTube links, podcasts, PDFs, audio, or video. Successful stdout-producing runs are saved under /tmp/summarize."

@@ -10,6 +10,9 @@ skills-check:
 skills-test:
   python -B -m unittest discover -s tests -v
 
+summarize-test:
+  python -B -m unittest discover -s bin/tests -p 'test_summarize.py' -v
+
 web-clip-test:
   python -B -m unittest discover -s tests -p 'test_web_clip.py' -v
 

@@ -1,17 +1,53 @@
 #!/usr/bin/env python3
-"""Run the steipete summarize CLI through npx."""
+"""Run the steipete summarize CLI through npx and save stdout copies."""
 
 from __future__ import annotations
 
-import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 
 PACKAGE = "@steipete/summarize"
 MIN_NODE_MAJOR = 24
+SAVE_DIR = Path("/tmp/summarize")
+OPTIONS_WITH_VALUES = {
+    "--embedded-video",
+    "--firecrawl",
+    "--format",
+    "--language",
+    "--lang",
+    "--length",
+    "--markdown-mode",
+    "--max-extract-characters",
+    "--max-output-tokens",
+    "--metrics",
+    "--model",
+    "--preprocess",
+    "--prompt",
+    "--prompt-file",
+    "--retries",
+    "--service-tier",
+    "--slides-dir",
+    "--slides-max",
+    "--slides-min-duration",
+    "--slides-scene-threshold",
+    "--speaker-at",
+    "--speaker-profile",
+    "--stream",
+    "--theme",
+    "--thinking",
+    "--timeout",
+    "--transcriber",
+    "--video-mode",
+    "--width",
+    "--youtube",
+}
 
 
 def command_version(command: str) -> str | None:
@@ -35,6 +71,93 @@ def node_major(version: str) -> int | None:
     return int(match.group(1))
 
 
+def output_kind(argv: list[str]) -> str:
+    return "transcript" if "--extract" in argv else "summary"
+
+
+def input_label(argv: list[str]) -> str:
+    skip_next = False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "-":
+            return "stdin"
+        if arg in OPTIONS_WITH_VALUES:
+            skip_next = True
+            continue
+        if arg.startswith("--") and "=" in arg:
+            continue
+        if arg.startswith("-"):
+            continue
+        return arg
+    return "input"
+
+
+def slugify(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme and parsed.netloc:
+        video_id = parse_qs(parsed.query).get("v", [""])[0]
+        value = "-".join(part for part in [parsed.netloc, video_id or parsed.path] if part)
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-._")
+    return value[:80] or "input"
+
+
+def save_path(argv: list[str]) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return SAVE_DIR / f"{timestamp}-{output_kind(argv)}-{slugify(input_label(argv))}.md"
+
+
+def should_save(argv: list[str]) -> bool:
+    return not any(arg in {"--help", "-h", "--version"} for arg in argv)
+
+
+def run_and_save(argv: list[str]) -> int:
+    destination = save_path(argv) if should_save(argv) else None
+    if destination is not None:
+        SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    saved_file = None
+    command = ["npx", "-y", PACKAGE, *argv]
+    completed = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+    output_seen = False
+    try:
+        if destination is not None:
+            saved_file = tempfile.NamedTemporaryFile(
+                "w",
+                delete=False,
+                dir=SAVE_DIR,
+                encoding="utf-8",
+                prefix=f".{destination.name}.",
+            )
+            temp_path = Path(saved_file.name)
+
+        assert completed.stdout is not None
+        for chunk in completed.stdout:
+            output_seen = True
+            if saved_file is not None:
+                saved_file.write(chunk)
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+
+        return_code = completed.wait()
+    finally:
+        if saved_file is not None:
+            saved_file.close()
+
+    if return_code == 0 and output_seen and destination is not None and temp_path is not None:
+        temp_path.replace(destination)
+        print(f"Saved summarize output to {destination}", file=sys.stderr)
+    elif temp_path is not None:
+        temp_path.unlink(missing_ok=True)
+    return return_code
+
+
 def main(argv: list[str]) -> int:
     if shutil.which("npx") is None:
         print("summarize wrapper requires npx on PATH.", file=sys.stderr)
@@ -50,8 +173,7 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
-    os.execvp("npx", ["npx", "-y", PACKAGE, *argv])
-    return 127
+    return run_and_save(argv)
 
 
 if __name__ == "__main__":

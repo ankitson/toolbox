@@ -1,5 +1,21 @@
 # Toolbox Notes
 
+## 2026-06-19 — Summarize saved output copies
+
+### Goal
+- Preserve `summarize` stdout for later lookup without changing the normal
+  streaming CLI behavior.
+
+### Decision
+- Keep `summarize` as a custom local skill. `skills.toml` remains only for
+  external skill sources and generated router bundles.
+- Save successful stdout-producing wrapper runs under `/tmp/summarize/`, using
+  timestamped Markdown filenames with `summary` or `transcript` in the name.
+- Treat `--extract` output as transcript/source output; all other runs are
+  summary output.
+- Update `skills/summarize/SKILL.md`, `skills/summarize/agents/openai.yaml`, and
+  README usage notes so agents and humans know where saved copies land.
+
 ## 2026-06-18 — Portable skill router generation
 
 ### Goal

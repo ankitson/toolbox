@@ -1,5 +1,17 @@
 # Toolbox Changelog
 
+## 2026-06-19
+
+### Summarize output copies
+- Changed `bin/summarize` to stream stdout as before while saving successful
+  stdout-producing runs under `/tmp/summarize/`.
+- Added timestamped saved-file names that distinguish summaries from
+  `--extract` transcript/source output.
+- Updated the summarize skill guidance, OpenAI agent metadata, and README usage
+  notes to mention saved output copies.
+- Added focused regression coverage for saved stdout copies and a
+  `just summarize-test` helper.
+
 ## 2026-06-18
 
 ### Skill router generation

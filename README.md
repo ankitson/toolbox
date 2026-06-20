@@ -86,7 +86,8 @@ absorbs = ["owner/repo:skills/alpha", "local:vendor/skills/example/beta"]
 ```
 
 Summarize URLs, files, media, or stdin through the steipete CLI without
-installing its daemon/browser extension:
+installing its daemon/browser extension. Successful stdout-producing runs are
+also copied to `/tmp/summarize/`:
 
 ```sh
 just summarize "https://example.com" --plain
