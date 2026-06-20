@@ -296,3 +296,18 @@ fork at `/projects/external-repo/wezterm/investigations/` (fixes on the `fix/*`
 branches of `github.com/ankitson/wezterm`). All three fixes are deployed locally
 (Mac `wezterm-gui` bundle + Linux `wezterm-mux-server`); durability needs a one-time
 `sudo cp ~/wezterm-patched-bin/* /usr/bin/` (now done).
+
+## 2026-06-19 — Autoresearch skill import
+
+### Goal
+- Add the Autoresearch agent skill to the canonical toolbox skill tree.
+
+### Decisions
+- Use `uditgoenka/autoresearch` instead of `karpathy/autoresearch`.
+- Track the upstream `master` branch explicitly because the repository does not
+  publish a `main` branch.
+- Import the portable skill from `.agents/skills/autoresearch`, which contains
+  the `SKILL.md` and companion command/reference markdown files.
+
+### Verification
+- Synced `skills/autoresearch` from upstream commit `166755a2600a`.

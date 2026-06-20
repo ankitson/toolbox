@@ -168,3 +168,12 @@
 ### Docme
 - Generated fallback sites now always include a `Docs` listing page.
 - When a project already has a root `README.md` or `index.md`, `docme` keeps that homepage and writes the listing to `docs.md` or the next available fallback name.
+
+## 2026-06-19
+
+### Autoresearch skill
+- Added `skills/autoresearch` from `uditgoenka/autoresearch` at upstream commit
+  `166755a2600a`.
+- Registered the external source in `skills.toml` with `ref = "master"` and
+  `path = ".agents/skills/autoresearch"` so future `skillctl sync` runs can
+  refresh it.

@@ -1,5 +1,6 @@
-# External skill sources copied into skills/ by bin/skillctl sync.
-# Any skill directory not listed here is custom and edited locally.
+# Authoritative external skill sources and generated router bundles.
+# Standalone [skills.*] entries materialize as top-level skills.
+# [routers.*].absorbs entries materialize inside router references.
 
 [skills.agent-browser]
 repo = "vercel-labs/agent-browser"
@@ -7,6 +8,11 @@ repo = "vercel-labs/agent-browser"
 [skills.anthropics]
 repo = "anthropics/skills"
 path = "skills/{claude-api,skill-creator}"
+
+[skills.autoresearch]
+repo = "uditgoenka/autoresearch"
+ref = "master"
+path = ".agents/skills/autoresearch"
 
 [skills.autoreview]
 repo = "openclaw/agent-skills"
