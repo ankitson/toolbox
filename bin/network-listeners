@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+"""Audit local TCP/UDP listeners by network exposure."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime
+import ipaddress
+import json
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import textwrap
+from typing import Iterable
+
+
+TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
+TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+WILDCARD_HOSTS = {"*", "0.0.0.0", "::"}
+PROCESS_RE = re.compile(r'\("((?:[^"\\]|\\.)*)",pid=(\d+)')
+BRIDGE_PREFIXES = (
+    "br-",
+    "cni",
+    "docker",
+    "flannel",
+    "kind",
+    "kube",
+    "lxdbr",
+    "minikube",
+    "nerdctl",
+    "podman",
+    "veth",
+    "virbr",
+)
+VPN_PREFIXES = ("tap", "tun", "wg")
+MIN_COLLAPSE_RANGE_LENGTH = 5
+SECTION_KINDS = {
+    "wildcard": {"wildcard"},
+    "lan": {"lan", "private"},
+    "tailscale-only": {"tailscale"},
+    "other": {"bridge", "link-local", "other", "public", "unknown", "vpn"},
+    "loopback": {"loopback"},
+}
+TABLE_MAX_WIDTHS = {
+    "Process": 20,
+    "Listeners": 34,
+    "Binds": 50,
+    "Notes": 20,
+}
+
+
+@dataclass(frozen=True)
+class InterfaceAddress:
+    address: str
+    interface: str
+    kind: str
+    family: str
+
+
+@dataclass(frozen=True)
+class InterfaceIndex:
+    addresses: tuple[InterfaceAddress, ...]
+    by_address: dict[str, InterfaceAddress]
+
+
+@dataclass(frozen=True)
+class Listener:
+    proto: str
+    state: str
+    host: str
+    port: str
+    interface_hint: str | None
+    kind: str
+    process: str
+    raw_local: str
+    raw_line: str
+
+    @property
+    def bind_label(self) -> str:
+        if self.host == "::":
+            host = "[::]"
+        elif ":" in self.host:
+            scoped = f"{self.host}%{self.interface_hint}" if self.interface_hint else self.host
+            host = f"[{scoped}]"
+        elif self.interface_hint:
+            host = f"{self.host}%{self.interface_hint}"
+        else:
+            host = self.host
+        return f"{host}:{self.port}" if self.port else host
+
+
+@dataclass
+class ListenerGroup:
+    proto: str
+    port: str
+    process: str
+    listeners: list[Listener]
+
+    @property
+    def kinds(self) -> set[str]:
+        return {listener.kind for listener in self.listeners}
+
+    @property
+    def exposure(self) -> str:
+        non_loopback = {kind for kind in self.kinds if kind != "loopback"}
+        if "wildcard" in non_loopback:
+            return "wildcard"
+        if non_loopback & {"lan", "private"}:
+            return "lan"
+        if non_loopback and non_loopback <= {"tailscale"}:
+            return "tailscale-only"
+        if non_loopback:
+            return "other"
+        return "loopback"
+
+    def visible_listeners(self, include_loopback: bool = False) -> list[Listener]:
+        if include_loopback:
+            return self.listeners
+        return [listener for listener in self.listeners if listener.kind != "loopback"]
+
+
+@dataclass(frozen=True)
+class SectionRow:
+    proto: str
+    port: str
+    process: str
+    binds: str
+    notes: str
+    sort_port: int
+    range_key: tuple[str, str, str, str]
+
+    def table_values(self) -> list[str]:
+        return [self.proto, self.port, self.process, self.binds, self.notes]
+
+
+@dataclass(frozen=True)
+class ProcessDisplayRow:
+    process: str
+    listeners: str
+    binds: str
+    notes: str
+    sort_port: int
+
+    def table_values(self) -> list[str]:
+        return [self.process, self.listeners, self.binds, self.notes]
+
+
+def classify_interface(link: dict[str, object]) -> str:
+    ifname = str(link.get("ifname", ""))
+    flags = set(link.get("flags", []))
+    link_type = str(link.get("link_type", ""))
+
+    if ifname == "lo" or "LOOPBACK" in flags:
+        return "loopback"
+    if "tailscale" in ifname.lower():
+        return "tailscale"
+    if ifname.startswith(BRIDGE_PREFIXES) or link.get("master") or link.get("link_netnsid") is not None:
+        return "bridge"
+    if ifname.startswith(VPN_PREFIXES) or "POINTOPOINT" in flags:
+        return "vpn"
+    if link_type in {"ether", "infiniband"}:
+        return "lan"
+    return "other"
+
+
+def parse_ip_addr_json(payload: str) -> InterfaceIndex:
+    addresses: list[InterfaceAddress] = []
+    for link in json.loads(payload or "[]"):
+        ifname = str(link.get("ifname", ""))
+        kind = classify_interface(link)
+        for item in link.get("addr_info", []):
+            family = str(item.get("family", ""))
+            local = str(item.get("local", ""))
+            if not local:
+                continue
+            addresses.append(
+                InterfaceAddress(
+                    address=local,
+                    interface=ifname,
+                    kind=kind,
+                    family=family,
+                )
+            )
+    return InterfaceIndex(
+        addresses=tuple(addresses),
+        by_address={item.address: item for item in addresses},
+    )
+
+
+def load_interfaces() -> tuple[InterfaceIndex, list[str]]:
+    if shutil.which("ip") is None:
+        return InterfaceIndex((), {}), ["ip command not found; interface classification is range-based only."]
+
+    completed = subprocess.run(
+        ["ip", "-j", "addr", "show"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    warnings: list[str] = []
+    if completed.returncode:
+        warnings.append(f"ip addr failed with exit {completed.returncode}: {completed.stderr.strip()}")
+        return InterfaceIndex((), {}), warnings
+    if completed.stderr.strip():
+        warnings.append(completed.stderr.strip())
+    return parse_ip_addr_json(completed.stdout), warnings
+
+
+def split_host_port(local: str) -> tuple[str, str, str | None]:
+    interface_hint: str | None = None
+    if local.startswith("["):
+        end = local.rfind("]")
+        host = local[1:end] if end != -1 else local.strip("[]")
+        remainder = local[end + 1 :] if end != -1 else ""
+        if remainder.startswith("%"):
+            scoped_interface, separator, scoped_port = remainder[1:].partition(":")
+            interface_hint = scoped_interface or None
+            port = scoped_port if separator else ""
+        else:
+            port = remainder[1:] if remainder.startswith(":") else ""
+    else:
+        host, separator, port = local.rpartition(":")
+        if not separator:
+            host, port = local, ""
+
+    if "%" in host:
+        host, interface_hint = host.split("%", 1)
+    return host or "*", port, interface_hint
+
+
+def parse_processes(line: str) -> str:
+    processes = []
+    for name, pid in PROCESS_RE.findall(line):
+        name = name.replace(r"\"", '"').replace(r"\\", "\\")
+        processes.append(f"{name}[{pid}]")
+    return ", ".join(sorted(set(processes))) or "-"
+
+
+def process_key(process: str) -> str:
+    if process == "-":
+        return process
+    names = []
+    for part in process.split(", "):
+        match = re.fullmatch(r"(.+)\[\d+\]", part)
+        names.append(match.group(1) if match else part)
+    return ", ".join(sorted(set(names)))
+
+
+def is_tailscale_ip(address: ipaddress._BaseAddress) -> bool:
+    return address in TAILSCALE_V4 or address in TAILSCALE_V6
+
+
+def classify_host(host: str, interface_hint: str | None, interfaces: InterfaceIndex) -> str:
+    if host in WILDCARD_HOSTS:
+        return "wildcard"
+
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return "unknown"
+
+    interface = interfaces.by_address.get(str(address))
+    interface_kind = interface.kind if interface else None
+    if interface_hint and interface_hint.startswith("tailscale"):
+        interface_kind = "tailscale"
+
+    if address.is_loopback:
+        return "loopback"
+    if is_tailscale_ip(address) or interface_kind == "tailscale":
+        return "tailscale"
+    if interface_kind in {"bridge", "vpn"}:
+        return interface_kind
+    if address.is_link_local:
+        return "link-local"
+    if interface_kind == "lan":
+        return "lan"
+    if address.is_private:
+        return "private"
+    if address.is_global:
+        return "public"
+    return "other"
+
+
+def parse_ss_line(line: str, interfaces: InterfaceIndex) -> Listener | None:
+    parts = line.split(None, 5)
+    if len(parts) < 5:
+        return None
+
+    proto, state, _recv_q, _send_q, local = parts[:5]
+    host, port, interface_hint = split_host_port(local)
+    return Listener(
+        proto=proto.lower(),
+        state=state,
+        host=host,
+        port=port,
+        interface_hint=interface_hint,
+        kind=classify_host(host, interface_hint, interfaces),
+        process=parse_processes(line),
+        raw_local=local,
+        raw_line=line,
+    )
+
+
+def run_ss(include_processes: bool = True) -> tuple[list[str], list[str], int]:
+    if shutil.which("ss") is None:
+        return [], ["ss command not found; install iproute2."], 127
+
+    command = ["ss", "-H", "-lntu", "-O"]
+    if include_processes:
+        command.append("-p")
+    completed = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode:
+        fallback = [part for part in command if part != "-O"]
+        completed = subprocess.run(
+            fallback,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    warnings = [completed.stderr.strip()] if completed.stderr.strip() else []
+    return completed.stdout.splitlines(), warnings, completed.returncode
+
+
+def collect_listeners(
+    interfaces: InterfaceIndex,
+    include_processes: bool = True,
+) -> tuple[list[Listener], list[str], int]:
+    lines, warnings, returncode = run_ss(include_processes=include_processes)
+    listeners = [
+        listener
+        for line in lines
+        if (listener := parse_ss_line(line, interfaces)) is not None
+    ]
+    return listeners, warnings, returncode
+
+
+def group_listeners(listeners: Iterable[Listener]) -> list[ListenerGroup]:
+    grouped: dict[tuple[str, str, str], ListenerGroup] = {}
+    for listener in listeners:
+        key = (listener.proto, listener.port, process_key(listener.process))
+        group = grouped.setdefault(
+            key,
+            ListenerGroup(
+                proto=listener.proto,
+                port=listener.port,
+                process=key[2],
+                listeners=[],
+            ),
+        )
+        group.listeners.append(listener)
+    return sorted(grouped.values(), key=group_sort_key)
+
+
+def group_sort_key(group: ListenerGroup) -> tuple[int, str, str, str]:
+    try:
+        port = int(group.port)
+    except ValueError:
+        port = 1_000_000
+    return port, group.proto, group.process, ",".join(sorted(listener.bind_label for listener in group.listeners))
+
+
+def format_table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    if not rows:
+        return ["  (none)"]
+    widths = []
+    for index, header in enumerate(headers):
+        natural_width = max(len(header), *(len(row[index]) for row in rows))
+        widths.append(min(natural_width, TABLE_MAX_WIDTHS.get(header, natural_width)))
+    lines = [
+        "  " + "  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)),
+        "  " + "  ".join("-" * width for width in widths),
+    ]
+    for row in rows:
+        wrapped = [wrap_table_cell(value, widths[index]) for index, value in enumerate(row)]
+        for line_index in range(max(len(cell) for cell in wrapped)):
+            values = [
+                cell[line_index] if line_index < len(cell) else ""
+                for cell in wrapped
+            ]
+            lines.append(
+                ("  " + "  ".join(value.ljust(widths[index]) for index, value in enumerate(values))).rstrip()
+            )
+    return lines
+
+
+def wrap_table_cell(value: str, width: int) -> list[str]:
+    return textwrap.wrap(
+        value,
+        width=width,
+        break_long_words=False,
+        break_on_hyphens=False,
+    ) or [""]
+
+
+def format_bindings(listeners: Iterable[Listener]) -> str:
+    return ", ".join(sorted({listener.bind_label for listener in listeners}))
+
+
+def section_listeners(group: ListenerGroup, exposure: str) -> list[Listener]:
+    kinds = SECTION_KINDS[exposure]
+    return [listener for listener in group.listeners if listener.kind in kinds]
+
+
+def hidden_bind_summary(group: ListenerGroup, shown: list[Listener]) -> str:
+    shown_ids = {id(listener) for listener in shown}
+    counts: dict[str, int] = {}
+    for listener in group.listeners:
+        if id(listener) in shown_ids or listener.kind == "loopback":
+            continue
+        counts[listener.kind] = counts.get(listener.kind, 0) + 1
+    if not counts:
+        return ""
+    return "also " + ", ".join(f"{kind}={count}" for kind, count in sorted(counts.items()))
+
+
+def bind_range_template(listeners: Iterable[Listener], port: str) -> str:
+    templates = []
+    suffix = f":{port}"
+    for listener in listeners:
+        label = listener.bind_label
+        templates.append(f"{label[: -len(port)]}{{port}}" if label.endswith(suffix) else label)
+    return ", ".join(sorted(set(templates)))
+
+
+def port_sort_value(port: str) -> int:
+    try:
+        return int(port)
+    except ValueError:
+        return 1_000_000
+
+
+def section_rows(groups: list[ListenerGroup], exposure: str) -> list[SectionRow]:
+    rows: list[SectionRow] = []
+    for group in groups:
+        if group.exposure != exposure:
+            continue
+        visible = section_listeners(group, exposure)
+        if not visible:
+            continue
+        notes = hidden_bind_summary(group, visible)
+        bind_template = bind_range_template(visible, group.port)
+        rows.append(
+            SectionRow(
+                proto=group.proto,
+                port=group.port,
+                process=group.process,
+                binds=format_bindings(visible),
+                notes=notes,
+                sort_port=port_sort_value(group.port),
+                range_key=(group.proto, group.process, bind_template, notes),
+            )
+        )
+    return collapse_port_ranges(rows)
+
+
+def collapse_port_ranges(rows: list[SectionRow]) -> list[SectionRow]:
+    collapsed: list[SectionRow] = []
+    pending: list[SectionRow] = []
+
+    def flush() -> None:
+        if not pending:
+            return
+        if len(pending) < MIN_COLLAPSE_RANGE_LENGTH:
+            collapsed.extend(pending)
+            pending.clear()
+            return
+        first = pending[0]
+        last = pending[-1]
+        bind_template = first.range_key[2]
+        port_range = f"{first.port}-{last.port}"
+        collapsed.append(
+            SectionRow(
+                proto=first.proto,
+                port=port_range,
+                process=first.process,
+                binds=bind_template.replace("{port}", port_range),
+                notes=first.notes,
+                sort_port=first.sort_port,
+                range_key=first.range_key,
+            )
+        )
+        pending.clear()
+
+    for row in rows:
+        if (
+            pending
+            and row.range_key == pending[-1].range_key
+            and row.sort_port == pending[-1].sort_port + 1
+        ):
+            pending.append(row)
+            continue
+        flush()
+        pending.append(row)
+    flush()
+    return collapsed
+
+
+def listener_summary(row: SectionRow) -> str:
+    return f"{row.proto}:{row.port}"
+
+
+def process_display_rows(rows: list[SectionRow]) -> list[ProcessDisplayRow]:
+    grouped: dict[str, list[SectionRow]] = {}
+    passthrough: list[SectionRow] = []
+    for row in rows:
+        if row.process == "-":
+            passthrough.append(row)
+        else:
+            grouped.setdefault(row.process, []).append(row)
+
+    display_rows = [
+        ProcessDisplayRow(
+            process=row.process,
+            listeners=listener_summary(row),
+            binds=row.binds,
+            notes=row.notes,
+            sort_port=row.sort_port,
+        )
+        for row in passthrough
+    ]
+    for process, process_rows in grouped.items():
+        binds = list(dict.fromkeys(row.binds for row in process_rows))
+        notes = list(dict.fromkeys(row.notes for row in process_rows if row.notes))
+        display_rows.append(
+            ProcessDisplayRow(
+                process=process,
+                listeners=", ".join(listener_summary(row) for row in process_rows),
+                binds="; ".join(binds),
+                notes=", ".join(notes),
+                sort_port=min(row.sort_port for row in process_rows),
+            )
+        )
+    return sorted(display_rows, key=lambda row: (row.sort_port, row.process, row.listeners))
+
+
+def format_process_table(rows: list[SectionRow]) -> list[str]:
+    headers = ["Process", "Listeners", "Binds", "Notes"]
+    table_rows = [row.table_values() for row in process_display_rows(rows)]
+    if table_rows and all(not row[-1] for row in table_rows):
+        return format_table(headers[:-1], [row[:-1] for row in table_rows])
+    return format_table(headers, table_rows)
+
+
+def format_section_table(rows: list[SectionRow], group_processes: bool = True) -> list[str]:
+    if group_processes:
+        return format_process_table(rows)
+
+    headers = ["Proto", "Port", "Process", "Binds", "Notes"]
+    table_rows = [row.table_values() for row in rows]
+    if table_rows and all(not row[-1] for row in table_rows):
+        return format_table(headers[:-1], [row[:-1] for row in table_rows])
+    return format_table(headers, table_rows)
+
+
+def format_item_list(label: str, items: list[str], empty: str = "(none detected)") -> list[str]:
+    prefix = f"  {label}: "
+    if not items:
+        return [f"{prefix}{empty}"]
+    return textwrap.wrap(
+        ", ".join(items),
+        width=100,
+        initial_indent=prefix,
+        subsequent_indent=" " * len(prefix),
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+
+
+def interface_summary(interfaces: InterfaceIndex) -> list[str]:
+    lines = ["Interfaces:"]
+    for kind, label in (("lan", "LAN"), ("tailscale", "Tailscale")):
+        items = [
+            f"{item.address}/{item.interface}"
+            for item in interfaces.addresses
+            if item.kind == kind and not item.address.startswith("fe80:")
+        ]
+        lines.extend(format_item_list(label, items))
+    others = [
+        f"{item.address}/{item.interface} ({item.kind})"
+        for item in interfaces.addresses
+        if item.kind not in {"lan", "tailscale", "loopback"} and not item.address.startswith("fe80:")
+    ]
+    if others:
+        lines.extend(format_item_list("Other non-loopback", others))
+    return lines
+
+
+def format_report(
+    groups: list[ListenerGroup],
+    interfaces: InterfaceIndex,
+    warnings: list[str],
+    include_loopback: bool = False,
+    group_processes: bool = True,
+) -> str:
+    sections = [
+        ("wildcard", "Wildcard listeners (0.0.0.0 / ::)"),
+        ("lan", "LAN/private IP listeners"),
+        ("tailscale-only", "Tailscale-only listeners"),
+        ("other", "Other non-loopback listeners"),
+    ]
+    if include_loopback:
+        sections.append(("loopback", "Loopback-only listeners"))
+
+    lines = [
+        f"Network listener audit for {socket.gethostname()} at {datetime.now().isoformat(timespec='seconds')}",
+        "Services are grouped by protocol, port, and process. Tailscale-only ignores loopback binds.",
+        "",
+        *interface_summary(interfaces),
+    ]
+    if warnings:
+        lines.extend(["", "Warnings:", *(f"  {warning}" for warning in warnings)])
+
+    for exposure, title in sections:
+        rows = section_rows(groups, exposure)
+        lines.extend(["", title, *format_section_table(rows, group_processes=group_processes)])
+    return "\n".join(lines) + "\n"
+
+
+def listener_to_dict(listener: Listener) -> dict[str, str | None]:
+    return {
+        "proto": listener.proto,
+        "state": listener.state,
+        "host": listener.host,
+        "port": listener.port,
+        "interface_hint": listener.interface_hint,
+        "kind": listener.kind,
+        "process": listener.process,
+        "bind": listener.bind_label,
+        "raw_local": listener.raw_local,
+    }
+
+
+def group_to_dict(group: ListenerGroup) -> dict[str, object]:
+    return {
+        "proto": group.proto,
+        "port": group.port,
+        "process": group.process,
+        "exposure": group.exposure,
+        "kinds": sorted(group.kinds),
+        "listeners": [listener_to_dict(listener) for listener in group.listeners],
+    }
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Audit local TCP/UDP listeners by wildcard, LAN, Tailscale, and other binds.",
+    )
+    parser.add_argument(
+        "--include-loopback",
+        action="store_true",
+        help="include a loopback-only section in the text report",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit machine-readable JSON instead of a text report",
+    )
+    parser.add_argument(
+        "--no-processes",
+        action="store_true",
+        help="skip ss -p process lookup",
+    )
+    parser.add_argument(
+        "--no-process-groups",
+        action="store_true",
+        help="show one row per protocol/port/process instead of collapsing rows by process name",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    interfaces, interface_warnings = load_interfaces()
+    listeners, ss_warnings, returncode = collect_listeners(
+        interfaces,
+        include_processes=not args.no_processes,
+    )
+    groups = group_listeners(listeners)
+    warnings = interface_warnings + ss_warnings
+
+    if args.json:
+        payload = {
+            "host": socket.gethostname(),
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "interfaces": [item.__dict__ for item in interfaces.addresses],
+            "warnings": warnings,
+            "services": [group_to_dict(group) for group in groups],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(
+            format_report(
+                groups,
+                interfaces,
+                warnings,
+                include_loopback=args.include_loopback,
+                group_processes=not args.no_process_groups,
+            ),
+            end="",
+        )
+    return returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

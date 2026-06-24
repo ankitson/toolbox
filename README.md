@@ -94,6 +94,15 @@ just summarize "https://example.com" --plain
 bin/summarize "/path/to/file.pdf" --length long --plain
 ```
 
+Audit TCP/UDP services listening on network interfaces, grouped by wildcard
+binds, LAN/private IPs, Tailscale-only binds, and other non-loopback binds:
+
+```sh
+just network-listeners
+bin/network-listeners --json
+bin/network-listeners --no-process-groups
+```
+
 When no path is provided, `skillctl` looks for the same common layouts used by
 skill package repos: repo root `SKILL.md`, `skills/<name>/SKILL.md`,
 `<name>/SKILL.md`, or the only skill folder in the repo. If a repo has multiple

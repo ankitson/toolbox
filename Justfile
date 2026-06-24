@@ -34,6 +34,9 @@ web-clip url output="clips":
 summarize *args:
   @bin/summarize {{args}}
 
+network-listeners *args:
+  @bin/network-listeners {{args}}
+
 # Kept as a short alias for interactive use.
 list: skills-list
 
