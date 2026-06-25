@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""
+Capture Windows-side WezTerm diagnostics over SSH.
+
+This complements bin/wezterm-trace, which captures the Unix mux/server side.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+SECRET_PATTERNS = [
+    re.compile(r"(?i)(authorization:\s*bearer\s+)[^\s'\"]+"),
+    re.compile(r"(?i)(authorization:\s*basic\s+)[^\s'\"]+"),
+    re.compile(r"(?i)(api[_-]?key\s*[=:]\s*)[^\s'\",;]+"),
+    re.compile(r"(?i)(token\s*[=:]\s*)[^\s'\",;]+"),
+    re.compile(r"(?i)(secret\s*[=:]\s*)[^\s'\",;]+"),
+    re.compile(r"(?i)(password\s*[=:]\s*)[^\s'\",;]+"),
+    re.compile(r"(?i)(passwd\s*[=:]\s*)[^\s'\",;]+"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{12,}\b"),
+]
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def local_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def redact_text(text: str) -> str:
+    redacted = text
+    for pattern in SECRET_PATTERNS:
+        redacted = pattern.sub(lambda m: (m.group(1) if m.groups() else "") + "<REDACTED>", redacted)
+    return redacted
+
+
+def redact_obj(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: ("<REDACTED>" if re.search(r"(?i)(TOKEN|SECRET|PASSWORD|PASSWD|KEY|AUTH)", str(key)) else redact_obj(item)) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_obj(item) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
+    return value
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(redact_text(text), encoding="utf-8", errors="replace")
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(redact_obj(data), indent=2, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def run_cmd(args: list[str], timeout: float, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        input=input_text,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+
+
+def resolve_pid(client_match: str | None) -> int | None:
+    if not client_match:
+        return None
+    result = run_cmd(["wezterm", "cli", "list-clients", "--format", "json"], timeout=8)
+    if result.returncode != 0:
+        raise SystemExit(f"wezterm cli list-clients failed: {result.stderr or result.stdout}")
+    try:
+        clients = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"wezterm cli list-clients returned invalid JSON: {exc}") from exc
+    matches = [
+        client
+        for client in clients
+        if client_match.lower() in str(client.get("hostname", "")).lower()
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        summary = ", ".join(f"{c.get('hostname')} pid={c.get('pid')}" for c in matches)
+        raise SystemExit(f"multiple matching clients; pass --pid explicitly: {summary}")
+    pid = matches[0].get("pid")
+    return int(pid) if pid is not None else None
+
+
+def powershell_json_script(
+    *,
+    pid: int,
+    sample_count: int,
+    interval_ms: int,
+    collect_dump: bool,
+    wpr_seconds: int,
+) -> str:
+    dump_literal = "$true" if collect_dump else "$false"
+    return f"""
+$ProgressPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'SilentlyContinue'
+$pidValue = {pid}
+$sampleCount = {sample_count}
+$intervalMs = {interval_ms}
+$collectDump = {dump_literal}
+$wprSeconds = {wpr_seconds}
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$remoteOutDir = Join-Path $env:TEMP "wezterm-win-trace-$stamp"
+New-Item -ItemType Directory -Force -Path $remoteOutDir | Out-Null
+
+function To-Iso($value) {{
+  if ($null -eq $value) {{ return $null }}
+  try {{ return $value.ToString('o') }} catch {{ return [string]$value }}
+}}
+
+function Process-Row($p) {{
+  if ($null -eq $p) {{ return $null }}
+  $start = $null
+  try {{ $start = $p.StartTime.ToString('o') }} catch {{ $start = $null }}
+  [ordered]@{{
+    id = $p.Id
+    name = $p.ProcessName
+    cpuSeconds = $p.CPU
+    responding = $p.Responding
+    handles = $p.HandleCount
+    threads = $p.Threads.Count
+    workingSetMB = [math]::Round($p.WorkingSet64 / 1MB, 1)
+    privateMB = [math]::Round($p.PrivateMemorySize64 / 1MB, 1)
+    startTime = $start
+    title = $p.MainWindowTitle
+  }}
+}}
+
+$result = [ordered]@{{
+  capturedAt = (Get-Date -Format o)
+  computerName = $env:COMPUTERNAME
+  userName = $env:USERNAME
+  pid = $pidValue
+  remoteOutDir = $remoteOutDir
+  samples = @()
+  targetProcess = $null
+  targetCommandLine = $null
+  weztermProcesses = @()
+  topThreads = @()
+  threadDebug = [ordered]@{{ errors = @() }}
+  tools = [ordered]@{{}}
+  versions = [ordered]@{{}}
+  logDirs = @()
+  logFiles = @()
+  dump = $null
+  wpr = $null
+}}
+
+$wez = Join-Path $env:ProgramFiles 'WezTerm\\wezterm.exe'
+if (Test-Path $wez) {{
+  $result.versions.wezterm = (& $wez --version 2>&1 | Out-String).Trim()
+}}
+
+foreach ($tool in @('procdump.exe','cdb.exe','windbg.exe','wpr.exe','wpaexporter.exe')) {{
+  $cmd = Get-Command $tool -ErrorAction SilentlyContinue
+  $result.tools[$tool] = if ($cmd) {{ $cmd.Source }} else {{ $null }}
+}}
+
+for ($i = 0; $i -lt $sampleCount; $i++) {{
+  $p = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
+  $row = Process-Row $p
+  if ($row) {{
+    $row.sample = $i
+    $row.time = (Get-Date -Format o)
+    $result.samples += $row
+  }} else {{
+    $result.samples += [ordered]@{{ sample = $i; time = (Get-Date -Format o); missing = $true }}
+  }}
+  Start-Sleep -Milliseconds $intervalMs
+}}
+
+$target = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
+$result.targetProcess = Process-Row $target
+$result.targetCommandLine = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue" |
+  Select-Object ProcessId,Name,ExecutablePath,CommandLine,CreationDate
+
+$result.weztermProcesses = @(Get-Process wezterm* -ErrorAction SilentlyContinue | Sort-Object Id | ForEach-Object {{ Process-Row $_ }})
+
+if ($target) {{
+  $threadRows = @()
+  $result.threadDebug.targetThreadsCount = $target.Threads.Count
+  foreach ($thread in @($target.Threads)) {{
+    try {{
+      $waitReason = $null
+      try {{ $waitReason = [string]$thread.WaitReason }} catch {{ $waitReason = $null }}
+      $threadRows += [PSCustomObject][ordered]@{{
+        id = $thread.Id
+        state = [string]$thread.ThreadState
+        waitReason = $waitReason
+        totalMs = [math]::Round($thread.TotalProcessorTime.TotalMilliseconds, 3)
+        userMs = [math]::Round($thread.UserProcessorTime.TotalMilliseconds, 3)
+        privilegedMs = [math]::Round($thread.PrivilegedProcessorTime.TotalMilliseconds, 3)
+        startAddress = ('0x{{0:x}}' -f $thread.StartAddress.ToInt64())
+      }}
+    }} catch {{
+      $result.threadDebug.errors += $_.Exception.Message
+    }}
+  }}
+  $result.threadDebug.rowsBuilt = $threadRows.Count
+  $result.topThreads = @($threadRows | Sort-Object totalMs -Descending | Select-Object -First 32)
+  $result.threadDebug.rowsAfterSort = $result.topThreads.Count
+}} else {{
+  $result.threadDebug.targetThreadsCount = $null
+  $result.threadDebug.rowsBuilt = 0
+  $result.threadDebug.rowsAfterSort = 0
+}}
+
+$dirs = @(
+  (Join-Path $env:LOCALAPPDATA 'wezterm'),
+  (Join-Path $env:USERPROFILE '.local\\share\\wezterm'),
+  (Join-Path $env:USERPROFILE '.config\\wezterm'),
+  (Join-Path $env:APPDATA 'wezterm')
+)
+foreach ($dir in $dirs) {{
+  $exists = Test-Path $dir
+  $result.logDirs += [ordered]@{{ path = $dir; exists = $exists }}
+  if ($exists) {{
+    $result.logFiles += @(Get-ChildItem -LiteralPath $dir -File -Recurse -ErrorAction SilentlyContinue |
+      Sort-Object LastWriteTime -Descending |
+      Select-Object -First 80 |
+      ForEach-Object {{
+        [ordered]@{{ path = $_.FullName; bytes = $_.Length; lastWriteTime = $_.LastWriteTime.ToString('o') }}
+      }})
+  }}
+}}
+
+if ($collectDump -and $target) {{
+  $dumpPath = Join-Path $remoteOutDir "wezterm-gui-$pidValue.dmp"
+  $rundll = Join-Path $env:WINDIR 'System32\\rundll32.exe'
+  $entry = (Join-Path $env:WINDIR 'System32\\comsvcs.dll') + ', MiniDump'
+  $dumpProc = Start-Process -FilePath $rundll -ArgumentList @($entry, $pidValue, $dumpPath, 'full') -NoNewWindow -Wait -PassThru
+  $dumpItem = Get-Item $dumpPath -ErrorAction SilentlyContinue
+  $result.dump = [ordered]@{{
+    path = $dumpPath
+    exitCode = $dumpProc.ExitCode
+    exists = $null -ne $dumpItem
+    bytes = if ($dumpItem) {{ $dumpItem.Length }} else {{ $null }}
+    lastWriteTime = if ($dumpItem) {{ $dumpItem.LastWriteTime.ToString('o') }} else {{ $null }}
+  }}
+}}
+
+if ($wprSeconds -gt 0) {{
+  $etlPath = Join-Path $remoteOutDir 'wezterm-cpu.etl'
+  $cancelOutput = (& wpr.exe -cancel 2>&1 | Out-String)
+  $startOutput = (& wpr.exe -start CPU -filemode 2>&1 | Out-String)
+  $startCode = $LASTEXITCODE
+  $stopOutput = $null
+  $stopCode = $null
+  if ($startCode -eq 0) {{
+    Start-Sleep -Seconds $wprSeconds
+    $stopOutput = (& wpr.exe -stop $etlPath 2>&1 | Out-String)
+    $stopCode = $LASTEXITCODE
+  }}
+  $etlItem = Get-Item $etlPath -ErrorAction SilentlyContinue
+  $result.wpr = [ordered]@{{
+    path = $etlPath
+    startExitCode = $startCode
+    stopExitCode = $stopCode
+    exists = $null -ne $etlItem
+    bytes = if ($etlItem) {{ $etlItem.Length }} else {{ $null }}
+    lastWriteTime = if ($etlItem) {{ $etlItem.LastWriteTime.ToString('o') }} else {{ $null }}
+    cancelOutput = $cancelOutput.Trim()
+    startOutput = $startOutput.Trim()
+    stopOutput = if ($stopOutput) {{ $stopOutput.Trim() }} else {{ $null }}
+  }}
+}}
+
+$result | ConvertTo-Json -Depth 8
+"""
+
+
+def run_remote(args: argparse.Namespace, pid: int, out_dir: Path) -> dict[str, Any]:
+    sample_count = max(1, int(round(args.duration / args.interval)))
+    interval_ms = max(1, int(args.interval * 1000))
+    script = powershell_json_script(
+        pid=pid,
+        sample_count=sample_count,
+        interval_ms=interval_ms,
+        collect_dump=args.dump,
+        wpr_seconds=args.wpr_seconds,
+    )
+    ssh_args = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={args.connect_timeout}",
+        args.host,
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "-",
+    ]
+    timeout = args.connect_timeout + args.duration + args.wpr_seconds + (120 if args.dump else 20)
+    started = time.time()
+    proc = run_cmd(ssh_args, timeout=timeout, input_text=script)
+    write_text(out_dir / "windows.stdout.txt", proc.stdout)
+    write_text(out_dir / "windows.stderr.txt", proc.stderr)
+    write_json(
+        out_dir / "remote-command.meta.json",
+        {
+            "args": ssh_args,
+            "returncode": proc.returncode,
+            "duration_ms": int((time.time() - started) * 1000),
+            "captured_at": utc_now(),
+        },
+    )
+    if proc.returncode != 0:
+        raise SystemExit(f"remote trace command failed with {proc.returncode}; see {out_dir}")
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"remote trace command returned non-JSON stdout; see {out_dir}: {exc}") from exc
+    write_json(out_dir / "windows.json", data)
+    return data
+
+
+def scp_remote_file(host: str, remote_path: str, local_dir: Path, timeout: float) -> Path:
+    if not remote_path:
+        raise ValueError("empty remote path")
+    local_dir.mkdir(parents=True, exist_ok=True)
+    remote_spec = f"{host}:{remote_path.replace(chr(92), '/')}"
+    proc = run_cmd(["scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", remote_spec, str(local_dir)], timeout=timeout)
+    write_text(local_dir / "scp.stderr.txt", proc.stderr)
+    write_text(local_dir / "scp.stdout.txt", proc.stdout)
+    if proc.returncode != 0:
+        raise SystemExit(f"scp failed for {remote_path}: {proc.stderr or proc.stdout}")
+    return local_dir / Path(remote_path.replace("\\", "/")).name
+
+
+def make_archive(out_dir: Path) -> Path:
+    archive = out_dir.with_suffix(".tar.gz")
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(out_dir, arcname=out_dir.name)
+    return archive
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Capture Windows WezTerm GUI diagnostics over SSH.")
+    parser.add_argument("--host", default="ts-desktop-win", help="Windows SSH host; default: ts-desktop-win")
+    parser.add_argument("--pid", type=int, help="Windows wezterm-gui PID; defaults to resolving from list-clients")
+    parser.add_argument("--client-match", default="desktop-win", help="hostname substring for local list-clients PID resolution")
+    parser.add_argument("--duration", type=float, default=5.0, help="seconds to sample process counters; default: 5")
+    parser.add_argument("--interval", type=float, default=0.5, help="sampling interval in seconds; default: 0.5")
+    parser.add_argument("--out", type=Path, default=Path.home() / "wezterm_traces", help="trace output root")
+    parser.add_argument("--dump", action="store_true", help="capture a rundll32/comsvcs minidump on the Windows host")
+    parser.add_argument("--fetch-dump", action="store_true", help="copy the dump back with scp; implies --dump")
+    parser.add_argument("--wpr-seconds", type=int, default=0, help="collect a WPR CPU ETL trace for N seconds; can be large")
+    parser.add_argument("--fetch-wpr", action="store_true", help="copy the WPR ETL back with scp; beware large files")
+    parser.add_argument("--connect-timeout", type=int, default=5, help="SSH connect timeout in seconds; default: 5")
+    parser.add_argument("--no-archive", action="store_true", help="skip creating a local tar.gz archive")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    if args.fetch_dump:
+        args.dump = True
+    if args.duration <= 0:
+        raise SystemExit("--duration must be positive")
+    if args.interval <= 0:
+        raise SystemExit("--interval must be positive")
+    if not shutil.which("ssh"):
+        raise SystemExit("ssh not found")
+
+    pid = args.pid if args.pid is not None else resolve_pid(args.client_match)
+    if pid is None:
+        raise SystemExit("could not resolve Windows client PID; pass --pid")
+
+    out_dir = args.out.expanduser() / f"wezterm-win-trace-{local_stamp()}"
+    out_dir.mkdir(parents=True, exist_ok=False)
+    write_json(
+        out_dir / "trace_meta.json",
+        {
+            "started_at": utc_now(),
+            "host": args.host,
+            "pid": pid,
+            "argv": sys.argv,
+            "redaction": "best-effort common secret pattern redaction applied before writing outputs",
+        },
+    )
+
+    print(f"trace dir: {out_dir}")
+    print(f"capturing Windows WezTerm PID {pid} on {args.host}...")
+    data = run_remote(args, pid, out_dir)
+
+    fetched: dict[str, str] = {}
+    if args.fetch_dump and data.get("dump", {}).get("exists"):
+        print("fetching dump...")
+        fetched["dump"] = str(scp_remote_file(args.host, data["dump"]["path"], out_dir / "artifacts", timeout=240))
+    if args.fetch_wpr and data.get("wpr", {}).get("exists"):
+        print("fetching WPR ETL...")
+        fetched["wpr"] = str(scp_remote_file(args.host, data["wpr"]["path"], out_dir / "artifacts", timeout=900))
+
+    write_json(
+        out_dir / "trace_complete.json",
+        {
+            "completed_at": utc_now(),
+            "fetched": fetched,
+            "archive_pending": not args.no_archive,
+        },
+    )
+    if not args.no_archive:
+        archive = make_archive(out_dir)
+        write_json(
+            out_dir / "trace_complete.json",
+            {
+                "completed_at": utc_now(),
+                "fetched": fetched,
+                "archive": str(archive),
+            },
+        )
+        print(f"archive: {archive}")
+    else:
+        print("archive: skipped")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

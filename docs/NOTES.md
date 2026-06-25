@@ -1,5 +1,33 @@
 # Toolbox Notes
 
+## 2026-06-22
+
+### Windows WezTerm SSHMUX freeze tracing
+
+#### Discovery
+- A frozen Windows client was still connected to the Linux mux as
+  `desktop-win`, PID `64616`, through proxy PID `3151073`.
+- Linux-side `wezterm-trace` showed 0 focus transitions during the freeze, so it
+  did not match the June 13 PaneFocused storm signature.
+- Windows process sampling showed `wezterm-gui.exe` was `Responding=True` but
+  consuming roughly one CPU-second per wall-second on a single hot thread.
+- Windows was running `wezterm 20260117-154428-05343b38`, while the Linux tool
+  reported `20260425-155631-44a8f937`; the local fork keeps the resize dead-loop
+  and activate-tab resize fixes on separate branches from the PaneFocused fix.
+
+#### Artifacts
+- Linux mux trace:
+  `/home/ankit/wezterm_traces/wezterm-trace-20260622-143642.tar.gz`.
+- Manual Windows minidump and process evidence:
+  `logs/wezterm-windows-freeze-20260622-144023/`.
+- Repeatable Windows trace-helper run with fetched minidump:
+  `/home/ankit/wezterm_traces/wezterm-win-trace-20260622-145036/`.
+
+#### Decision
+- Add a Windows-side SSH trace helper so future freezes can capture process
+  samples, thread CPU, logs, optional minidumps, and optional WPR traces without
+  hand-written PowerShell.
+
 ## 2026-06-19 — Summarize saved output copies
 
 ### Goal

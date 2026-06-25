@@ -103,6 +103,18 @@ bin/network-listeners --json
 bin/network-listeners --no-process-groups
 ```
 
+WezTerm SSHMUX freezes usually need both sides of the connection. Capture the
+Unix mux/server side with `bin/wezterm-trace`; capture a Windows GUI client over
+SSH with:
+
+```sh
+just wezterm-win-trace --pid 64616 --dump
+```
+
+Omit `--pid` when `wezterm cli list-clients --format json` can resolve the
+Windows client from `--client-match desktop-win`. `--wpr-seconds N` collects a
+Windows CPU ETL trace and can produce very large files.
+
 When no path is provided, `skillctl` looks for the same common layouts used by
 skill package repos: repo root `SKILL.md`, `skills/<name>/SKILL.md`,
 `<name>/SKILL.md`, or the only skill folder in the repo. If a repo has multiple

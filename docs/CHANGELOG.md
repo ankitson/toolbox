@@ -1,5 +1,14 @@
 # Toolbox Changelog
 
+## 2026-06-22
+
+### WezTerm Windows freeze tracing
+- Added `bin/wezterm-win-trace` to capture Windows-side WezTerm GUI diagnostics
+  over SSH, including process samples, hot thread state, command line, log file
+  inventory, optional minidump capture, and optional WPR CPU traces.
+- Added `just wezterm-win-trace` and README usage notes for pairing Windows GUI
+  traces with the existing Unix mux-side `bin/wezterm-trace`.
+
 ## 2026-06-19
 
 ### Summarize output copies

@@ -37,6 +37,9 @@ summarize *args:
 network-listeners *args:
   @bin/network-listeners {{args}}
 
+wezterm-win-trace *args:
+  @bin/wezterm-win-trace {{args}}
+
 # Kept as a short alias for interactive use.
 list: skills-list
 
