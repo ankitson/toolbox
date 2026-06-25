@@ -1,5 +1,36 @@
 # Toolbox Changelog
 
+## 2026-06-24
+
+### Document work chronology
+- Normalized `docs/CHANGELOG.md` and `docs/NOTES.md` to use reverse
+  chronological day sections with one `## YYYY-MM-DD` header per day.
+- Updated `skills/document-work/SKILL.md` so future work logs group multiple
+  same-day changes under a single date header.
+
+### Chezmoi skill safety
+- Reworked `skills/chezmoi-skill/SKILL.md` so agents preview changes and get
+  explicit user consent before applying to live dotfiles.
+- Removed broad `Bash(chezmoi *)` guidance and replaced it with narrower
+  command patterns focused on previews, source lookup, source updates, and
+  noninteractive targeted apply.
+- Replaced routine `chezmoi apply --refresh-externals --force` guidance with
+  consent-gated `chezmoi apply --no-tty <target...>` and last-resort force
+  language.
+
+### Network listener audit helper
+- Added `bin/network-listeners` to audit TCP/UDP sockets from `ss`, grouping
+  listeners by wildcard binds, LAN/private IP binds, Tailscale-only exposure,
+  and other non-loopback interfaces.
+- Text output filters binds to the relevant section and wraps wide cells so
+  mixed-interface services do not create unreadable table rows.
+- Consecutive listener runs of five or more ports with the same protocol,
+  process name, bind pattern, and notes are collapsed into one range row.
+- Text output now groups rows by process name by default; use
+  `--no-process-groups` to show the protocol/port table.
+- Added focused parser/classification tests plus `just network-listeners` and
+  README usage notes.
+
 ## 2026-06-22
 
 ### WezTerm Windows freeze tracing
@@ -10,6 +41,13 @@
   traces with the existing Unix mux-side `bin/wezterm-trace`.
 
 ## 2026-06-19
+
+### Autoresearch skill
+- Added `skills/autoresearch` from `uditgoenka/autoresearch` at upstream commit
+  `166755a2600a`.
+- Registered the external source in `skills.toml` with `ref = "master"` and
+  `path = ".agents/skills/autoresearch"` so future `skillctl sync` runs can
+  refresh it.
 
 ### Summarize output copies
 - Changed `bin/summarize` to stream stdout as before while saving successful
@@ -69,7 +107,25 @@
   method, URL, status, reason, and server response body, and flag `5xx` as a
   server-side failure and `429` as rate limiting.
 
+## 2026-06-12
+
+### Docme
+- Generated fallback sites now always include a `Docs` listing page.
+- When a project already has a root `README.md` or `index.md`, `docme` keeps that homepage and writes the listing to `docs.md` or the next available fallback name.
+
 ## 2026-06-11
+
+### Docme
+- Added `bin/docme`, a PEP 723 `uv run --script` tool for building or serving a quick MkDocs Material site from Markdown files.
+- `docme` scans all `.md` files under the current directory up to depth 3 by default; `--depth` and `--root` make the scan configurable.
+- `docme build --output DIR` writes the built site to a configurable output directory and does not know about webby or deployment.
+- `docme` uses an existing `mkdocs.yml`/`mkdocs.yaml` in the root directory before falling back to generated Markdown staging.
+- Generated fallback config uses the `pymdownx.slugs.slugify` GitHub-compatible slugifier so hand-written anchors with punctuation resolve.
+- `docme` sets `NO_MKDOCS_2_WARNING=true` for MkDocs subprocesses to suppress Material's MkDocs 2.0 banner while preserving normal build output.
+- Fallback staging now includes local files linked from Markdown, using symlinks where possible and copies as a fallback.
+- `docme` no longer runs MkDocs in strict mode; skipped missing, outside-root, or over-size linked files are reported separately.
+- Added a configurable linked-file size cap, defaulting to 25 MiB via `--max-linked-file-size-mib`.
+- Generated fallback sites default to Material's slate palette with IBM Plex Sans text and IBM Plex Mono code fonts.
 
 ### Remeddy remote editor launcher
 - Renamed the utility to `bin/remeddy`.
@@ -98,41 +154,19 @@
 
 ## 2026-06-04
 
+### Cloudflare skills
+- Added Cloudflare's official external skills from `cloudflare/skills`.
+- Registered `cloudflare`, `agents-sdk`, `durable-objects`, `sandbox-sdk`,
+  `wrangler`, `web-perf`, `cloudflare-email-service`, and
+  `workers-best-practices` in `skills.toml`.
+- Copied the skill folders into `skills/` so the existing Codex skills symlink
+  can discover them.
+
 ### Summarize CLI integration
 - Added `bin/summarize`, a Node 24+ preflight wrapper around
   `npx -y @steipete/summarize`.
 - Added `skills/summarize` with terse CLI-only usage guidance for agents.
 - Added `just summarize` and README usage examples.
-
-## 2026-05-29
-
-### Skill management cleanup
-- Removed the old `sync-skills.py` + `skills.yaml` sync system.
-- Evaluated and rejected `npx skills` (vercel-labs/skills) as the manager: it
-  installs into per-agent skill dirs, which here are all chezmoi symlinks to this
-  one directory — it would fight the symlinks for no gain (multi-agent
-  distribution is already solved by the symlinks). Removed its `.skill-lock.json`
-  and the `just skills-*` wrappers.
-- New flow: skills are plain files under `skills/`; committing them IS the
-  distribution. Third-party skills are vendored via `just vendor` (plain git) and
-  their sources tracked in `VENDORED.md`.
-- Vendored `rdt-cli` (Reddit CLI skill) — requires `uv tool install rdt-cli`.
-- `/projects/toolbox` is the canonical clone; `~/toolbox` and `~/.agents` are
-  chezmoi symlinks to it; agent skill dirs symlink to `skills/`.
-
-## 2026-06-02
-
-### Declarative skill manager
-- Added `skills.json` as the source of truth for custom, vendored, and
-  repo-backed skills.
-- Added `bin/skillctl` to add, sync, remove, list, validate, and document skills.
-- Replaced manual edits to `VENDORED.md` with generated provenance docs.
-- Replaced the destructive one-off `just vendor` recipe with `just skills-*`
-  manager commands.
-- Added local-Git regression coverage for custom, vendored, and repo-backed
-  workflows and overwrite guardrails.
-- Documented the ownership boundary: `devdocker/dotfiles` chezmoi wiring handles
-  distribution; toolbox only manages canonical skill contents and provenance.
 
 ## 2026-06-02
 
@@ -160,41 +194,30 @@
 - Verified the required All Things Distributed article, Python docs, and an AWS
   blog smoke case.
 
-## 2026-06-04
+### Declarative skill manager
+- Added `skills.json` as the source of truth for custom, vendored, and
+  repo-backed skills.
+- Added `bin/skillctl` to add, sync, remove, list, validate, and document skills.
+- Replaced manual edits to `VENDORED.md` with generated provenance docs.
+- Replaced the destructive one-off `just vendor` recipe with `just skills-*`
+  manager commands.
+- Added local-Git regression coverage for custom, vendored, and repo-backed
+  workflows and overwrite guardrails.
+- Documented the ownership boundary: `devdocker/dotfiles` chezmoi wiring handles
+  distribution; toolbox only manages canonical skill contents and provenance.
 
-### Cloudflare skills
-- Added Cloudflare's official external skills from `cloudflare/skills`.
-- Registered `cloudflare`, `agents-sdk`, `durable-objects`, `sandbox-sdk`,
-  `wrangler`, `web-perf`, `cloudflare-email-service`, and
-  `workers-best-practices` in `skills.toml`.
-- Copied the skill folders into `skills/` so the existing Codex skills symlink
-  can discover them.
+## 2026-05-29
 
-## 2026-06-11
-
-### Docme
-- Added `bin/docme`, a PEP 723 `uv run --script` tool for building or serving a quick MkDocs Material site from Markdown files.
-- `docme` scans all `.md` files under the current directory up to depth 3 by default; `--depth` and `--root` make the scan configurable.
-- `docme build --output DIR` writes the built site to a configurable output directory and does not know about webby or deployment.
-- `docme` uses an existing `mkdocs.yml`/`mkdocs.yaml` in the root directory before falling back to generated Markdown staging.
-- Generated fallback config uses the `pymdownx.slugs.slugify` GitHub-compatible slugifier so hand-written anchors with punctuation resolve.
-- `docme` sets `NO_MKDOCS_2_WARNING=true` for MkDocs subprocesses to suppress Material's MkDocs 2.0 banner while preserving normal build output.
-- Fallback staging now includes local files linked from Markdown, using symlinks where possible and copies as a fallback.
-- `docme` no longer runs MkDocs in strict mode; skipped missing, outside-root, or over-size linked files are reported separately.
-- Added a configurable linked-file size cap, defaulting to 25 MiB via `--max-linked-file-size-mib`.
-- Generated fallback sites default to Material's slate palette with IBM Plex Sans text and IBM Plex Mono code fonts.
-
-## 2026-06-12
-
-### Docme
-- Generated fallback sites now always include a `Docs` listing page.
-- When a project already has a root `README.md` or `index.md`, `docme` keeps that homepage and writes the listing to `docs.md` or the next available fallback name.
-
-## 2026-06-19
-
-### Autoresearch skill
-- Added `skills/autoresearch` from `uditgoenka/autoresearch` at upstream commit
-  `166755a2600a`.
-- Registered the external source in `skills.toml` with `ref = "master"` and
-  `path = ".agents/skills/autoresearch"` so future `skillctl sync` runs can
-  refresh it.
+### Skill management cleanup
+- Removed the old `sync-skills.py` + `skills.yaml` sync system.
+- Evaluated and rejected `npx skills` (vercel-labs/skills) as the manager: it
+  installs into per-agent skill dirs, which here are all chezmoi symlinks to this
+  one directory — it would fight the symlinks for no gain (multi-agent
+  distribution is already solved by the symlinks). Removed its `.skill-lock.json`
+  and the `just skills-*` wrappers.
+- New flow: skills are plain files under `skills/`; committing them IS the
+  distribution. Third-party skills are vendored via `just vendor` (plain git) and
+  their sources tracked in `VENDORED.md`.
+- Vendored `rdt-cli` (Reddit CLI skill) — requires `uv tool install rdt-cli`.
+- `/projects/toolbox` is the canonical clone; `~/toolbox` and `~/.agents` are
+  chezmoi symlinks to it; agent skill dirs symlink to `skills/`.

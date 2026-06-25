@@ -1,24 +1,32 @@
 ---
 name: document-work
-description: maintain project docs - standard conventions. use after code changes.
+description: Maintain project docs and work logs using the repo's standard reverse-chronological format. Use after non-trivial code, tooling, skill, or documentation changes.
 ---
 
 # Document Work
 
-Follow these conventions whenever doing non-trivial work in a project. 
-Do not document small changes related to temporary uncommitted work
+Follow these conventions whenever doing non-trivial work in a project.
+Do not document small changes related to temporary uncommitted work.
 
 ## Required Structure
 
 Create if missing: `docs/NOTES.md`, `docs/CHANGELOG.md`, `logs/`, and a `Justfile` when there are repeatable commands.
 
+## Chronology
+
+Keep `docs/NOTES.md` and `docs/CHANGELOG.md` in reverse chronological order, with the latest date at the top.
+
+Use exactly one `## YYYY-MM-DD` header per day. If the day already exists, add a new change group under that existing date instead of creating a second date header. If the day does not exist, insert a new date section above older dates.
+
+Preserve the existing text of prior entries unless you are fixing chronology, heading structure, or a clear documentation error. When normalizing old docs, group duplicate same-day entries under one date header rather than leaving repeated dates.
+
 ## docs/NOTES.md
 
-Append-only running log. Add dated entries (`## YYYY-MM-DD — Title`) with goals, key decisions, discoveries, and next steps as you work. Never edit previous entries.
+Running work log. Group by date (`## YYYY-MM-DD`), then by logical work item (`### Title`). Use lower-level subsections such as `#### Goal`, `#### Discovery`, `#### Decision`, `#### Verification`, and `#### Next steps` to record goals, key decisions, discoveries, and follow-ups.
 
 ## docs/CHANGELOG.md
 
-Append-only log of code changes. Group by date (`## YYYY-MM-DD`), then by logical change (`### Change Group`). Record what was added/removed/modified and why.
+Log of code changes. Group by date (`## YYYY-MM-DD`), then by logical change (`### Change Group`). Record what was added, removed, or modified and why.
 
 ## Scoped Task Documentation
 
