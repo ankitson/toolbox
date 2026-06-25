@@ -15,7 +15,7 @@ Use this skill as a portable router for a related skill bundle. Do not read ever
 | --- | --- |
 | A relentless interview to sharpen a plan or design. | `references/grill-me/instructions.md` |
 | A relentless interview to sharpen a plan or design, which also creates docs (ADR's and glossary) as we go. | `references/grill-with-docs/instructions.md` |
-| Move issues through a state machine of triage roles — categorise, reproduce, grill if needed, and write agent-ready briefs. | `references/triage/instructions.md` |
+| Move issues and external PRs through a state machine of triage roles — categorise, verify, grill if needed, and write agent-ready briefs. | `references/triage/instructions.md` |
 | Ask the agent to zoom out a level and map the relevant modules and callers using the project's domain language. | `references/zoom-out/instructions.md` |
 
 ## Workflow

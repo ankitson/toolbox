@@ -1,64 +1,109 @@
 ---
 name: webby
-description: Serve a simple HTML app — internally via the home Caddy (instant, LAN/Tailscale) or publicly via Cloudflare Pages. Use when asked to "put this online", "drop an HTML page", "make a quick tool/visualization reachable", or publish to the public mini site.
+description: Serve or publish a static HTML app to localhost, Tailscale Serve, Tailscale Funnel, Cloudflare Pages, Caddy, or a custom command provider. Use when asked to put an HTML page/tool/visualization online, publish to a tailnet URL, or publish to a public mini site.
 ---
 
 # webby
 
-drop an html app, get a url. internal = instant Caddy. public = Cloudflare Pages.
+Drop a static app into a bag and get a URL. An app is a folder with
+`index.html` or a standalone `.html` file. Name it `tmp*` for scratch.
 
-an app is a **folder with `index.html`** or a **standalone `.html` file**.
-name it `tmp*` for throwaway (gitignored, shown under a Temp heading).
+Install: `cargo install webby-deploy && webby ls`
 
-## run it
-
-```sh
-bunx github:ankitson/webby <cmd>    # e.g. bunx github:ankitson/webby where
-```
-
-## first: find the bags
-
-paths and urls aren't hardcoded here — ask webby:
+## Bags
 
 ```sh
-webby where
+webby ls             # all bags
+webby ls -b local    # one bag
+webby where          # paths and provider URLs
 ```
 
-run everything from the webby dir (`bun run src/cli.ts …`), or via the wrapper if installed.
+Built-ins:
 
-## internal (instant, no deploy)
+- `local`: localhost preview, no config.
+- `tailnet`: `tailscale serve`.
+- `funnel`: `tailscale funnel`.
+- `public`: Cloudflare Pages.
+- `internal`: optional Caddy compatibility when configured by env.
+
+## Local Preview
 
 ```sh
-webby add ./clock.html              # → live now on the tools host
-webby add ./dashboard               # folder app
-webby add ./scratch.html --tmp      # throwaway
+webby add ./clock.html
+webby serve
 ```
 
-caddy serves it the moment it lands. no build, no deploy.
+This is safe and local-only.
 
-## public (Cloudflare Pages)
+## Tailnet
 
 ```sh
-webby pub ./vancouver-tides         # stage in public/ + deploy
-webby deploy --public               # re-push the whole public dir
+webby add ./dashboard -b tailnet
+webby deploy -b tailnet
 ```
 
-deploy is just "push the `public/` directory" — nothing more.
-public apps also appear on the internal listing automatically (symlinked).
+Requires authenticated `tailscale`.
 
-> **always confirm with the user before a public deploy** (`pub` / `deploy --public`).
-> it publishes to the live internet. internal `add` is safe — deploy is not.
-
-## the rest
+## Temporary Public
 
 ```sh
-webby ls                # list a bag (add --public for the public one)
-webby open <name>       # print/open the url
-webby rm <name>         # remove (add --public for public)
-webby domain <host>     # attach a custom domain to the public bag
+webby add ./demo -b funnel
+webby deploy -b funnel
 ```
 
-## notes
+Always confirm with the user before Funnel. It exposes the app publicly from
+the current machine.
 
-- secrets/domains live in `.env.secret`, never in code.
-- bun + typescript; `wrangler` via `bunx`.
+## Durable Public
+
+```sh
+webby pub ./vancouver-tides
+webby deploy -b public
+```
+
+Always confirm with the user before `pub` or `deploy -b public`. Cloudflare
+Pages publishes to the live internet and expects `CLOUDFLARE_ACCOUNT_ID` plus
+`CLOUDFLARE_API_TOKEN`, or a configured token command/reference.
+
+## Common Commands
+
+```sh
+webby add <path> [-b bag] [--name name] [--tmp] [--title T] [--description D] [--property K=V]
+webby docs <dir> [-b bag] [--name name] [--tmp] [--title T] [--description D] [--property K=V]
+webby rm <name> [-b bag]
+webby open <name> [-b bag]
+webby domain <host> -b public
+webby preview [app] -b <bag> [--force]
+webby init
+```
+
+## App Metadata
+
+Apps can carry card metadata inside their own HTML. For standalone apps, put it
+in the `.html` file; for folder apps, put it in `index.html`.
+
+```html
+<script type="application/webby+json">
+{
+  "title": "Network Audit",
+  "description": "Internal network and DNS audit notes.",
+  "properties": { "category": "Documents" }
+}
+</script>
+```
+
+`webby add` and `webby pub` can write that block into the staged app with
+`--title`, `--description`, and repeatable `--property key=value`.
+
+Use `webby docs ./docs --name project-docs` to generate a static docs app from
+a Markdown directory. It renders Markdown natively, reads optional YAML
+frontmatter, rewrites in-root `.md` links, copies linked in-root assets, and
+stages the result like any other folder app.
+
+## Notes
+
+- Rust CLI; use `cargo install --path .` locally.
+- `-b` / `--bag` is the only bag selector. There is no `--public` flag.
+- `webby preview` captures static optimized WebP card previews into `webby-previews/` via `uvx shot-scraper` and Pillow through `uvx`; pass an app name to refresh a single preview.
+- Generated bag indexes render static card HTML; `webby-card-grid.js` is emitted for reusable embeds, not required for the default index to show cards.
+- `command` providers can use `{dir}`, `{label}`, and `{url}` template values.
