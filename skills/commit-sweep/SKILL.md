@@ -53,7 +53,7 @@ Match commit date to the change's mtime when clear — so history reflects when 
 
 ## Message: Conventional Commits
 
-- `type(scope): summary` — imperative, lowercase, ≤~72, no period.
+- `type(scope): summary` — imperative, lowercase, ≤~72, no period. summary describes intent/outcome - body describes mechanics.
 - types: `feat fix docs refactor chore test build ci perf style`. scope optional.
 - body (blank line, wrapped) only when *why* isn't obvious: problem / tradeoff / gotcha. no padding.
 - cross-repo feature -> parallel msgs.
