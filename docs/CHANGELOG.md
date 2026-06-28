@@ -1,5 +1,15 @@
 # Toolbox Changelog
 
+## 2026-06-27
+
+### AgentsView search API documentation
+- Updated `skills/agentsview-api/SKILL.md` to use the dedicated
+  `/api/v1/search` endpoint for transcript content search.
+- Documented the search response shape, including `results[].session_id`,
+  snippet fields, `count`, and `next`.
+- Fixed the transcript formatting example to read from `.messages[]` and pass a
+  larger message `limit` for long sessions.
+
 ## 2026-06-24
 
 ### Document work chronology

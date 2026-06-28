@@ -1,5 +1,20 @@
 # Toolbox Notes
 
+## 2026-06-27
+
+### AgentsView search endpoint correction
+
+#### Discovery
+- AgentsView transcript search is served by `/api/v1/search?q=...&limit=...&sort=relevance`.
+- The older skill guidance incorrectly described full-text search as a
+  `search` query parameter on `/api/v1/sessions`, which produced broad and
+  misleading results for transcript lookups.
+
+#### Decision
+- Use `/api/v1/search` first when locating sessions by message content.
+- Treat `results[].session_id` as the identifier to pass to session detail and
+  message endpoints.
+
 ## 2026-06-24
 
 ### Document work chronology
