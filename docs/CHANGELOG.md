@@ -1,5 +1,17 @@
 # Toolbox Changelog
 
+## 2026-07-14
+
+### parakeet-asr: reusable OpenAI-compatible transcription skill
+
+- Added `skills/parakeet-asr`, a shared audio-transcription skill for Parakeet
+  behind Bifrost or another OpenAI-compatible `/audio/transcriptions` endpoint.
+- Added configurable endpoint, credential, and model environment variables plus
+  language, prompt, JSON, and output-path options.
+- Made writes atomic and normalized compatible API responses that return a JSON
+  `text` field despite requesting plain text, preventing API failures or JSON
+  wrappers from becoming bogus `.txt` transcripts.
+
 ## 2026-06-24
 
 ### Document work chronology

@@ -1,5 +1,44 @@
 # Toolbox Notes
 
+## 2026-07-14
+
+### Shared Parakeet transcription skill
+
+#### Goal
+
+Replace an OpenClaw-bundled transcription skill whose hard-coded OpenAI model
+could be routed to an incompatible provider with a reusable skill owned in the
+shared toolbox.
+
+#### Discovery
+
+- Bifrost request `44733b2a-062e-4649-8e71-08fcf800ba79` used provider `codex`
+  and model `gpt-4o-transcribe`; Codex rejected transcription as an unsupported
+  operation.
+- OpenClaw's bundled `openai-whisper-api` script defaults to that model and does
+  not consume its configured `config.model`, so setting only the OpenClaw skill
+  config did not affect the multipart request.
+- The Parakeet-compatible endpoint may return `{"text":"..."}` even when the
+  request asks for plain text.
+
+#### Decision
+
+- Added `skills/parakeet-asr` with a deterministic Parakeet default model while
+  keeping the API base, credential, and model override environment-driven so it
+  can be reused by any harness mounting toolbox skills.
+- The script uses an atomic temporary output, fails on non-2xx responses, and
+  unwraps JSON text responses for `.txt` output.
+- OpenClaw configuration and deployment remain in devserver; toolbox contains
+  no deployment-specific credential.
+
+#### Verification
+
+- Shell syntax and ShellCheck passed.
+- OpenClaw discovered the skill from `agents-skills-personal` with all runtime
+  requirements satisfied.
+- An end-to-end fixture request through OpenClaw's configured environment,
+  Bifrost, and Parakeet produced an 871-character plain-text transcript.
+
 ## 2026-06-24
 
 ### Document work chronology
