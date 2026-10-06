@@ -8,7 +8,7 @@ The shared search CLI defaulted to localhost:8080, which reaches another app on
 this host. Pointed its fallback URL and skill metadata to the existing
 search.home.ankitson.com instance; SEARXNG_URL still overrides it. Verified with
 a uv-run search returning JSON and three results. The Open WebUI/native Codex
-comparison is documented in devserver/docs/2026-10-06-web-search/.
+comparison is documented in the [engineering wiki investigation](../../../allplace/wiki/evals/open-webui-web-search-2026-10-06/open-webui-web-search-2026-10-06.md).
 
 ## 2026-08-02
 
