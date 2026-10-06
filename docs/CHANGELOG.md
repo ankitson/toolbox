@@ -1,5 +1,13 @@
 # Toolbox Changelog
 
+## 2026-10-06
+
+### Correct the shared SearXNG search endpoint
+
+- Changed the CLI fallback and skill metadata from localhost:8080 to the
+  existing search.home.ankitson.com endpoint, preserving environment overrides.
+- Verified a uv-run JSON search against the default instance.
+
 ## 2026-08-02
 
 ### td-reschedule-overdue: keep daily catch-up on today

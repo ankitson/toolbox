@@ -1,5 +1,15 @@
 # Toolbox Notes
 
+## 2026-10-06
+
+### SearXNG default endpoint
+
+The shared search CLI defaulted to localhost:8080, which reaches another app on
+this host. Pointed its fallback URL and skill metadata to the existing
+search.home.ankitson.com instance; SEARXNG_URL still overrides it. Verified with
+a uv-run search returning JSON and three results. The Open WebUI/native Codex
+comparison is documented in devserver/docs/2026-10-06-web-search/.
+
 ## 2026-08-02
 
 ### Todoist overdue daily catch-up
