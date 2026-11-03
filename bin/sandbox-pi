@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Launch a Pi session through Omnigent, confined to the directories you name.
+
+    sandbox-pi -r ~/data -w ~/results
+    sandbox-pi -r ~/a -r ~/b -w ~/out -w ~/scratch --model bifrost/some-model
+    sandbox-pi -r ~/data -p "summarise this"     # no -w: read-only session
+    sandbox-pi -r ~/data -w ~/results --dry-run  # print the config, launch nothing
+
+The session starts in the first -w directory (or the first -r directory when
+there is no -w). Everything else on disk is hidden except system directories
+such as /usr, and /tmp is private scratch space. Only the filesystem is
+restricted: network access and Omnigent's session tools stay available.
+
+This runs the headless `pi` harness in the Omnigent REPL/web UI rather than
+Pi's own TUI: `omnigent pi` (pi-native) hardcodes `sandbox: none`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+PROVIDER = "bifrost"  # gateway provider in ~/.omnigent/config.yaml
+CONFIG_DIR = Path.home() / "hroot" / "tmp" / "sandbox-pi"
+
+
+def pi_default_model() -> str | None:
+    """Follow Pi's configured default when it uses the same provider."""
+    try:
+        settings = json.loads((Path.home() / ".pi" / "agent" / "settings.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return settings.get("defaultModel") if settings.get("defaultProvider") == PROVIDER else None
+
+
+def resolve_dirs(raw_paths: list[str], flag: str) -> list[Path]:
+    dirs = []
+    for raw in raw_paths:
+        path = Path(raw).expanduser().resolve()
+        if not path.is_dir():
+            sys.exit(f"sandbox-pi: {flag} {raw}: not a directory")
+        if path == Path.home().resolve() or path in Path.home().resolve().parents:
+            sys.exit(f"sandbox-pi: {flag} {raw}: refusing to expose your home directory or above it")
+        if path not in dirs:
+            dirs.append(path)
+    return dirs
+
+
+def check_no_overlap(read_dirs: list[Path], write_dirs: list[Path]) -> None:
+    """A read-only directory inside a writable one would end up writable."""
+    for read_dir in read_dirs:
+        for write_dir in write_dirs:
+            if read_dir == write_dir or read_dir.is_relative_to(write_dir):
+                sys.exit(f"sandbox-pi: {read_dir} is inside writable {write_dir}, so it would not be read-only")
+
+
+def build_config(
+    read_dirs: list[Path],
+    write_dirs: list[Path],
+    model: str | None,
+) -> tuple[Path, dict]:
+    cwd = write_dirs[0] if write_dirs else read_dirs[0]
+    write_paths = ["."] if write_dirs else []
+    write_paths += [str(path) for path in write_dirs[1:]]
+    read_paths = [str(path) for path in read_dirs if path != cwd]
+
+    lines = [f"Your working directory is {cwd}."]
+    lines.append(f"Read-only directories: {', '.join(map(str, read_dirs)) or 'none'}.")
+    lines.append(f"Writable directories: {', '.join(map(str, write_dirs)) or 'none'}.")
+    lines.append("Everything else on disk is unavailable.")
+
+    executor: dict = {"harness": "pi", "auth": {"type": "provider", "name": PROVIDER}}
+    if model:
+        executor["model"] = model
+
+    config = {
+        "name": "sandbox-pi",
+        "prompt": "\n".join(lines),
+        "skills": "none",
+        "executor": executor,
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "write_paths": write_paths,
+                "read_paths": read_paths,
+            },
+        },
+    }
+    return cwd, config
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Launch a Pi session through Omnigent, confined to the directories you name.",
+    )
+    parser.add_argument("-r", "--read", action="append", default=[], metavar="DIR", help="read-only directory (repeatable)")
+    parser.add_argument("-w", "--write", action="append", default=[], metavar="DIR", help="writable directory (repeatable); the first is the working directory")
+    parser.add_argument("-m", "--model", help="model id; defaults to Pi's configured default model")
+    parser.add_argument("-p", "--prompt", help="first message to send")
+    parser.add_argument("--dry-run", action="store_true", help="print the generated config and exit")
+    args = parser.parse_args()
+
+    if not args.read and not args.write:
+        parser.error("name at least one directory with -r or -w")
+
+    read_dirs = resolve_dirs(args.read, "-r")
+    write_dirs = resolve_dirs(args.write, "-w")
+    check_no_overlap(read_dirs, write_dirs)
+
+    cwd, config = build_config(read_dirs, write_dirs, args.model or pi_default_model())
+    text = json.dumps(config, indent=2) + "\n"  # JSON is valid YAML
+
+    if args.dry_run:
+        print(f"# launch directory: {cwd}")
+        print(text, end="")
+        return
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    config_path = CONFIG_DIR / f"{hashlib.sha256(text.encode()).hexdigest()[:12]}.yaml"
+    config_path.write_text(text)
+
+    # Inherited session variables can attach this to the parent Omnigent session.
+    env = {key: value for key, value in os.environ.items() if not key.startswith("OMNIGENT")}
+    command = ["omnigent", "run", str(config_path)]
+    if args.prompt:
+        command += ["-p", args.prompt]
+    os.chdir(cwd)
+    os.execvpe("omnigent", command, env)
+
+
+if __name__ == "__main__":
+    main()
