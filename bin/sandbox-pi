@@ -1,40 +1,39 @@
 #!/usr/bin/env python3
-"""Launch a Pi session through Omnigent, confined to the directories you name.
+"""Open native Pi through Omnigent, confined to the directories you name.
 
     sandbox-pi -r ~/data -w ~/results
-    sandbox-pi -r ~/a -r ~/b -w ~/out -w ~/scratch --model bifrost/some-model
-    sandbox-pi -r ~/data -p "summarise this"     # no -w: read-only session
+    sandbox-pi -r ~/a -r ~/b -w ~/out -w ~/scratch
+    sandbox-pi -r ~/data                         # read-only session
     sandbox-pi -r ~/data -w ~/results --dry-run  # print the config, launch nothing
 
 The session starts in the first -w directory (or the first -r directory when
-there is no -w). Everything else on disk is hidden except system directories
-such as /usr, and /tmp is private scratch space. Only the filesystem is
-restricted: network access and Omnigent's session tools stay available.
+there is no -w). Everything else on disk is hidden except system directories,
+Pi's install, ~/.pi and Omnigent's Pi bridge directory. Pi needs those last two
+writable, so the model can read the credentials in ~/.pi. Network access and
+Omnigent's session tools stay available.
 
-This runs the headless `pi` harness in the Omnigent REPL/web UI rather than
-Pi's own TUI: `omnigent pi` (pi-native) hardcodes `sandbox: none`.
+`omnigent pi` always generates a `sandbox: none` spec, so this creates the session
+itself with the same wrapper label, then hands over to `omnigent pi --resume`.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
+import io
 import json
 import os
+import re
+import subprocess
 import sys
+import tarfile
+import tempfile
 from pathlib import Path
 
-PROVIDER = "bifrost"  # gateway provider in ~/.omnigent/config.yaml
-CONFIG_DIR = Path.home() / "hroot" / "tmp" / "sandbox-pi"
-
-
-def pi_default_model() -> str | None:
-    """Follow Pi's configured default when it uses the same provider."""
-    try:
-        settings = json.loads((Path.home() / ".pi" / "agent" / "settings.json").read_text())
-    except (OSError, ValueError):
-        return None
-    return settings.get("defaultModel") if settings.get("defaultProvider") == PROVIDER else None
+HOME = Path.home().resolve()
+CONFIG_PATH = HOME / ".omnigent" / "config.yaml"
+PI_INSTALL_DIRS = [HOME / ".local" / "bin", HOME / ".local" / "lib" / "node_modules"]
+PI_STATE_DIRS = [HOME / ".pi", HOME / ".omnigent" / "pi-native"]
+SESSION_LABELS = {"omnigent.ui": "terminal", "omnigent.wrapper": "pi-native-ui"}
 
 
 def resolve_dirs(raw_paths: list[str], flag: str) -> list[Path]:
@@ -43,7 +42,7 @@ def resolve_dirs(raw_paths: list[str], flag: str) -> list[Path]:
         path = Path(raw).expanduser().resolve()
         if not path.is_dir():
             sys.exit(f"sandbox-pi: {flag} {raw}: not a directory")
-        if path == Path.home().resolve() or path in Path.home().resolve().parents:
+        if path == HOME or path in HOME.parents:
             sys.exit(f"sandbox-pi: {flag} {raw}: refusing to expose your home directory or above it")
         if path not in dirs:
             dirs.append(path)
@@ -54,34 +53,22 @@ def check_no_overlap(read_dirs: list[Path], write_dirs: list[Path]) -> None:
     """A read-only directory inside a writable one would end up writable."""
     for read_dir in read_dirs:
         for write_dir in write_dirs:
-            if read_dir == write_dir or read_dir.is_relative_to(write_dir):
+            if read_dir.is_relative_to(write_dir):
                 sys.exit(f"sandbox-pi: {read_dir} is inside writable {write_dir}, so it would not be read-only")
 
 
-def build_config(
-    read_dirs: list[Path],
-    write_dirs: list[Path],
-    model: str | None,
-) -> tuple[Path, dict]:
+def build_config(read_dirs: list[Path], write_dirs: list[Path]) -> tuple[Path, dict]:
     cwd = write_dirs[0] if write_dirs else read_dirs[0]
     write_paths = ["."] if write_dirs else []
-    write_paths += [str(path) for path in write_dirs[1:]]
-    read_paths = [str(path) for path in read_dirs if path != cwd]
-
-    lines = [f"Your working directory is {cwd}."]
-    lines.append(f"Read-only directories: {', '.join(map(str, read_dirs)) or 'none'}.")
-    lines.append(f"Writable directories: {', '.join(map(str, write_dirs)) or 'none'}.")
-    lines.append("Everything else on disk is unavailable.")
-
-    executor: dict = {"harness": "pi", "auth": {"type": "provider", "name": PROVIDER}}
-    if model:
-        executor["model"] = model
-
+    write_paths += [str(path) for path in [*write_dirs[1:], *PI_STATE_DIRS]]
+    read_paths = [str(path) for path in [*read_dirs, *PI_INSTALL_DIRS] if path != cwd]
+    readable = ", ".join(map(str, read_dirs)) or "none"
+    writable = ", ".join(map(str, write_dirs)) or "none"
     config = {
         "name": "sandbox-pi",
-        "prompt": "\n".join(lines),
-        "skills": "none",
-        "executor": executor,
+        "prompt": f"Read-only directories: {readable}. Writable directories: {writable}.",
+        "executor": {"harness": "pi-native"},
+        "spawn": True,
         "os_env": {
             "type": "caller_process",
             "cwd": ".",
@@ -89,20 +76,51 @@ def build_config(
                 "type": "linux_bwrap",
                 "write_paths": write_paths,
                 "read_paths": read_paths,
+                "cwd_allow_hidden": ["*"],  # dotfiles in the granted directories, e.g. .git
             },
         },
     }
     return cwd, config
 
 
+def server_url() -> str:
+    match = re.search(r"^server:\s*(\S+)", CONFIG_PATH.read_text(), re.MULTILINE)
+    if not match:
+        sys.exit(f"sandbox-pi: no server set in {CONFIG_PATH}")
+    return match.group(1).rstrip("/")
+
+
+def create_session(config: dict) -> str:
+    text = json.dumps(config, indent=2).encode()  # JSON is valid YAML
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz") as bundle:
+        with tarfile.open(fileobj=bundle, mode="w:gz") as tar:
+            entry = tarfile.TarInfo("agent.yaml")
+            entry.size = len(text)
+            tar.addfile(entry, io.BytesIO(text))
+        bundle.flush()
+        result = subprocess.run(
+            [
+                "curl", "-sS", f"{server_url()}/v1/sessions",
+                "-F", f"metadata={json.dumps({'labels': SESSION_LABELS})}",
+                "-F", f"bundle=@{bundle.name};type=application/gzip",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    try:
+        session_id = json.loads(result.stdout).get("session_id")
+    except ValueError:
+        session_id = None
+    # An empty id would make `omnigent pi --resume` open the session picker.
+    if not session_id:
+        sys.exit(f"sandbox-pi: could not create the session: {result.stdout or result.stderr}")
+    return session_id
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Launch a Pi session through Omnigent, confined to the directories you name.",
-    )
+    parser = argparse.ArgumentParser(description="Open native Pi through Omnigent, confined to the directories you name.")
     parser.add_argument("-r", "--read", action="append", default=[], metavar="DIR", help="read-only directory (repeatable)")
     parser.add_argument("-w", "--write", action="append", default=[], metavar="DIR", help="writable directory (repeatable); the first is the working directory")
-    parser.add_argument("-m", "--model", help="model id; defaults to Pi's configured default model")
-    parser.add_argument("-p", "--prompt", help="first message to send")
     parser.add_argument("--dry-run", action="store_true", help="print the generated config and exit")
     args = parser.parse_args()
 
@@ -112,26 +130,18 @@ def main() -> None:
     read_dirs = resolve_dirs(args.read, "-r")
     write_dirs = resolve_dirs(args.write, "-w")
     check_no_overlap(read_dirs, write_dirs)
-
-    cwd, config = build_config(read_dirs, write_dirs, args.model or pi_default_model())
-    text = json.dumps(config, indent=2) + "\n"  # JSON is valid YAML
+    cwd, config = build_config(read_dirs, write_dirs)
 
     if args.dry_run:
         print(f"# launch directory: {cwd}")
-        print(text, end="")
+        print(json.dumps(config, indent=2))
         return
 
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    config_path = CONFIG_DIR / f"{hashlib.sha256(text.encode()).hexdigest()[:12]}.yaml"
-    config_path.write_text(text)
-
+    session_id = create_session(config)
     # Inherited session variables can attach this to the parent Omnigent session.
     env = {key: value for key, value in os.environ.items() if not key.startswith("OMNIGENT")}
-    command = ["omnigent", "run", str(config_path)]
-    if args.prompt:
-        command += ["-p", args.prompt]
     os.chdir(cwd)
-    os.execvpe("omnigent", command, env)
+    os.execvpe("omnigent", ["omnigent", "pi", "--resume", session_id], env)
 
 
 if __name__ == "__main__":
