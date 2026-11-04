@@ -42,8 +42,6 @@ def resolve_dirs(raw_paths: list[str], flag: str) -> list[Path]:
         path = Path(raw).expanduser().resolve()
         if not path.is_dir():
             sys.exit(f"sandbox-pi: {flag} {raw}: not a directory")
-        if path == HOME or path in HOME.parents:
-            sys.exit(f"sandbox-pi: {flag} {raw}: refusing to expose your home directory or above it")
         if path not in dirs:
             dirs.append(path)
     return dirs
